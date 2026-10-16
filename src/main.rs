@@ -40,6 +40,49 @@ const SUPPORTED_EXTS: &[&str] = &[
     "fbx", "pmx", "pmd", "usd", "usda", "usdc", "usdz",
 ];
 
+/// 修改时间新→旧；同时间（含读不到的 i64::MIN）按名称兜底
+fn sort_by_mtime(keyed: &mut [(i64, PathBuf)]) {
+    keyed.sort_by(|a, b| {
+        b.0.cmp(&a.0).then_with(|| {
+            win32::logical_name_cmp(
+                a.1.file_name().unwrap_or(a.1.as_os_str()),
+                b.1.file_name().unwrap_or(b.1.as_os_str()),
+            )
+        })
+    });
+}
+
+/// 按设置的排序方式排文件列表。"mtime" = 修改时间新→旧（资源管理器 Downloads 默认视图）；
+/// 其余按名称，走系统 StrCmpLogicalW，与资源管理器"按名称"同一比较器
+#[allow(clippy::ptr_arg)] // mtime 分支需要 drain 重建，必须持有 Vec
+fn sort_files(files: &mut Vec<PathBuf>, sort_by: &str) {
+    if sort_by == "mtime" {
+        let mut keyed: Vec<(i64, PathBuf)> = files
+            .drain(..)
+            .map(|p| {
+                let t = std::fs::metadata(&p)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(i64::MIN);
+                (t, p)
+            })
+            .collect();
+        sort_by_mtime(&mut keyed);
+
+        *files = keyed.into_iter().map(|(_, p)| p).collect();
+    } else {
+        files.sort_by(|a, b| {
+            win32::logical_name_cmp(
+                a.file_name().unwrap_or(a.as_os_str()),
+                b.file_name().unwrap_or(b.as_os_str()),
+            )
+            .then_with(|| a.cmp(b))
+        });
+    }
+}
+
 // ─── 主应用 ───────────────────────────────────────
 
 struct PhotoViewApp {
@@ -354,12 +397,7 @@ impl PhotoViewApp {
             }
         }
 
-        // 与资源管理器"按名称"排序完全一致：Windows 上直接调 StrCmpLogicalW
-        self.image_files.sort_by(|a, b| {
-            let an = a.file_name().unwrap_or(a.as_os_str());
-            let bn = b.file_name().unwrap_or(b.as_os_str());
-            win32::logical_name_cmp(an, bn).then_with(|| a.cmp(b))
-        });
+        sort_files(&mut self.image_files, &self.settings.sort_by);
         self.last_scanned_dir = Some(dir.to_path_buf());
     }
 
@@ -2304,6 +2342,70 @@ impl PhotoViewApp {
 
                     ui.add_space(10.0);
 
+                    // ── 翻页排序 ──
+
+                    ui.horizontal(|ui| {
+                        ui.add_space(4.0);
+
+                        ui.label(
+                            RichText::new("翻页排序")
+                                .size(15.0)
+                                .color(Color32::from_rgb(130, 170, 255))
+                                .strong(),
+                        );
+                    });
+
+                    ui.add_space(6.0);
+
+                    ui.horizontal(|ui| {
+                        ui.add_space(8.0);
+
+                        let sort_owned = self.settings.sort_by.clone();
+
+                        let mut sort: &str = sort_owned.as_str();
+
+                        ui.radio_value(
+                            &mut sort,
+                            "mtime",
+                            RichText::new("修改时间（新→旧）").size(13.0),
+                        );
+
+                        ui.radio_value(&mut sort, "name", RichText::new("名称").size(13.0));
+
+                        if sort != self.settings.sort_by {
+                            self.settings.sort_by = sort.to_string();
+
+                            self.settings.save();
+
+                            // 让当前目录按新顺序重扫，翻页立即生效
+                            self.last_scanned_dir = None;
+
+                            if let Some(dir) = self
+                                .current_path
+                                .as_ref()
+                                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                            {
+                                self.scan_dir(&dir);
+                            }
+                        }
+                    });
+
+                    ui.add_space(14.0);
+
+                    // 分隔线
+
+                    let sep_rect3 = ui.available_rect_before_wrap();
+
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(sep_rect3.left() + 14.0, sep_rect3.top()),
+                            egui::pos2(sep_rect3.right() - 14.0, sep_rect3.top()),
+                        ],
+                        egui::Stroke::new(1.0_f32, Color32::from_rgb(60, 60, 75)),
+                    );
+
+                    ui.add_space(10.0);
+
                     // ── 文件关联 ──
 
                     ui.horizontal(|ui| {
@@ -3517,6 +3619,50 @@ mod tests {
             "唯一候选应进近槽"
         );
         assert!(far.lock().unwrap().is_none(), "重复远目标不应二次加载");
+    }
+
+    #[test]
+    fn mtime_sort_is_newest_first_with_name_tiebreak() {
+        let mut keyed = vec![
+            (100i64, PathBuf::from("r\\old.png")),
+            (300, PathBuf::from("r\\new.png")),
+            (200, PathBuf::from("r\\mid.png")),
+            (100, PathBuf::from("r\\aaa.png")),
+            (i64::MIN, PathBuf::from("r\\no_time.png")),
+        ];
+        sort_by_mtime(&mut keyed);
+        let order: Vec<&str> = keyed
+            .iter()
+            .map(|(_, p)| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(
+            order,
+            vec!["new.png", "mid.png", "aaa.png", "old.png", "no_time.png"],
+            "新→旧，同时间按名称，读不到时间的垫底"
+        );
+    }
+
+    #[test]
+    fn name_sort_matches_explorer_order() {
+        let dir = std::env::temp_dir().join(format!("pv_sort_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+
+        let mut files: Vec<PathBuf> = ["IMG_10.png", "IMG_2.png", "page-010.jpg", "page-002.jpg"]
+            .iter()
+            .map(|n| dir.join(n))
+            .collect();
+        sort_files(&mut files, "name");
+        let order: Vec<&str> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(
+            order,
+            vec!["IMG_2.png", "IMG_10.png", "page-002.jpg", "page-010.jpg"]
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

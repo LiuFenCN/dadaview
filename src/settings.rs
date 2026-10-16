@@ -229,11 +229,25 @@ pub(crate) fn string_to_key(s: &str) -> Option<egui::Key> {
 
 // ─── 设置 ───────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppSettings {
     pub keybindings: KeyBindings,
 
     pub associated_exts: Vec<String>,
+
+    /// 翻页排序："mtime" = 修改时间新→旧（对齐资源管理器 Downloads 视图），"name" = 名称
+    pub sort_by: String,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            keybindings: KeyBindings::default(),
+            associated_exts: Vec::new(),
+            sort_by: "mtime".into(),
+        }
+    }
 }
 
 impl AppSettings {
