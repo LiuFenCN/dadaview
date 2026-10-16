@@ -40,6 +40,54 @@ const SUPPORTED_EXTS: &[&str] = &[
     "fbx", "pmx", "pmd", "usd", "usda", "usdc", "usdz",
 ];
 
+/// 资源管理器式的文件名比较：忽略大小写，连续数字按数值比（IMG_2 在 IMG_10 前）
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let (ab, bb) = (a.as_bytes(), b.as_bytes());
+
+    let (mut i, mut j) = (0usize, 0usize);
+
+    while i < ab.len() && j < bb.len() {
+        let (ca, cb) = (ab[i], bb[j]);
+
+        if ca.is_ascii_digit() && cb.is_ascii_digit() {
+            let i0 = i;
+
+            while i < ab.len() && ab[i].is_ascii_digit() {
+                i += 1;
+            }
+
+            let j0 = j;
+
+            while j < bb.len() && bb[j].is_ascii_digit() {
+                j += 1;
+            }
+
+            let sa = a[i0..i].trim_start_matches('0');
+
+            let sb = b[j0..j].trim_start_matches('0');
+
+            match sa.len().cmp(&sb.len()).then_with(|| sa.cmp(sb)) {
+                std::cmp::Ordering::Equal => continue,
+                o => return o,
+            }
+        }
+
+        let la = ca.to_ascii_lowercase();
+
+        let lb = cb.to_ascii_lowercase();
+
+        if la != lb {
+            return la.cmp(&lb);
+        }
+
+        i += 1;
+
+        j += 1;
+    }
+
+    (ab.len() - i).cmp(&(bb.len() - j))
+}
+
 // ─── 主应用 ───────────────────────────────────────
 
 struct PhotoViewApp {
@@ -354,7 +402,19 @@ impl PhotoViewApp {
             }
         }
 
-        self.image_files.sort();
+        self.image_files.sort_by(|a, b| {
+            let an = a
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+
+            let bn = b
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+
+            natural_cmp(&an, &bn).then_with(|| a.cmp(b))
+        });
         self.last_scanned_dir = Some(dir.to_path_buf());
     }
 
@@ -1018,6 +1078,28 @@ impl PhotoViewApp {
         }
     }
 
+    /// 在文件序列里按方向走一格，跳过 3D 模型：漫画模式只配真实图片
+    /// 找不到其它非模型文件时返回原下标
+    fn step_over_models(&self, from: usize, dir: i32) -> usize {
+        let l = self.image_files.len();
+
+        if l == 0 {
+            return from;
+        }
+
+        let mut idx = from;
+
+        for _ in 0..l {
+            idx = (idx as i64 + i64::from(dir.signum())).rem_euclid(l as i64) as usize;
+
+            if !mesh3d::is_model_path(&self.image_files[idx]) {
+                return idx;
+            }
+        }
+
+        from
+    }
+
     fn load_comic_second(&mut self, _ctx: &egui::Context) {
         self.comic_second_texture = None;
 
@@ -1031,9 +1113,11 @@ impl PhotoViewApp {
             return;
         }
 
-        let l = self.image_files.len();
+        let next_idx = self.step_over_models(self.current_index, 1);
 
-        let next_idx = (self.current_index + 1) % l;
+        if next_idx == self.current_index {
+            return; // 除当前外没有别的真实图片，不配对
+        }
 
         let next_path = self.image_files[next_idx].clone();
 
@@ -1117,14 +1201,25 @@ impl PhotoViewApp {
 
         let l = self.image_files.len();
 
-        let step = if self.comic_mode { 2 } else { 1 };
-
         let cur = self.current_path.clone();
 
-        // 3D 模型与当前图不预加载
+        let cur_idx = self.current_index;
+
+        // 漫画模式下目标 = 往前 N"页"（跳过 3D 模型）；单图模式仍是原始索引 ±N
         let target_at = |delta: isize| -> Option<PathBuf> {
-            let idx = (self.current_index as isize + delta * step as isize).rem_euclid(l as isize)
-                as usize;
+            let idx = if self.comic_mode {
+                let steps = delta.unsigned_abs();
+
+                let dir = if delta >= 0 { 1 } else { -1 };
+
+                let mut i = cur_idx;
+                for _ in 0..steps {
+                    i = self.step_over_models(i, dir);
+                }
+                i
+            } else {
+                (cur_idx as isize + delta).rem_euclid(l as isize) as usize
+            };
 
             let p = &self.image_files[idx];
 
@@ -1304,11 +1399,15 @@ impl PhotoViewApp {
             return;
         }
 
-        let step = if self.comic_mode { 2 } else { 1 };
-
+        // 漫画模式按"真实图片"翻页（跳过 3D 模型），一步 = 一页
         let l = self.image_files.len();
 
-        let next_idx = (self.current_index + step) % l;
+        let next_idx = if self.comic_mode {
+            let a = self.step_over_models(self.current_index, 1);
+            self.step_over_models(a, 1)
+        } else {
+            (self.current_index + 1) % l
+        };
 
         let path = self.image_files[next_idx].clone();
 
@@ -1439,11 +1538,15 @@ impl PhotoViewApp {
             return;
         }
 
-        let step = if self.comic_mode { 2 } else { 1 };
-
+        // 漫画模式按"真实图片"翻页（跳过 3D 模型），一步 = 一页
         let l = self.image_files.len();
 
-        let prev_idx = (self.current_index + l - step) % l;
+        let prev_idx = if self.comic_mode {
+            let a = self.step_over_models(self.current_index, -1);
+            self.step_over_models(a, -1)
+        } else {
+            (self.current_index + l - 1) % l
+        };
 
         let path = self.image_files[prev_idx].clone();
 
@@ -1645,6 +1748,17 @@ impl PhotoViewApp {
     }
 
     fn toggle_comic_mode(&mut self, ctx: &egui::Context) {
+        // 漫画模式不适用于 3D 模型文件
+        if !self.comic_mode
+            && (self.viewing_3d
+                || self
+                    .current_path
+                    .as_ref()
+                    .is_some_and(|p| mesh3d::is_model_path(p)))
+        {
+            return;
+        }
+
         self.comic_mode = !self.comic_mode;
 
         if self.comic_mode {
@@ -3458,5 +3572,62 @@ mod tests {
             "唯一候选应进近槽"
         );
         assert!(far.lock().unwrap().is_none(), "重复远目标不应二次加载");
+    }
+
+    #[test]
+    fn natural_cmp_matches_explorer_order() {
+        use std::cmp::Ordering;
+        assert_eq!(natural_cmp("IMG_2.png", "IMG_10.png"), Ordering::Less);
+        assert_eq!(natural_cmp("page-002.jpg", "page-010.jpg"), Ordering::Less);
+        // 忽略大小写
+        assert_eq!(natural_cmp("a.PNG", "B.png"), Ordering::Less);
+        assert_eq!(natural_cmp("PhotoView", "photoview"), Ordering::Equal);
+        // 数值相同的不同写法视为相等，由 scan_dir 的完整路径次级比较决定先后
+        assert_eq!(natural_cmp("img2.jpg", "img02.jpg"), Ordering::Equal);
+        // 纯数字段之外仍按字符比
+        assert_eq!(natural_cmp("12.jpg", "12.png"), Ordering::Less);
+    }
+
+    #[allow(clippy::field_reassign_with_default)]
+    #[test]
+    fn comic_steps_skip_model_files() {
+        let mut app = PhotoViewApp::default();
+        app.image_files = ["a.png", "b.obj", "c.stl", "d.png", "e.png"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+
+        // 从 a 前进一页应越过 b/c 直达 d
+        assert_eq!(app.step_over_models(0, 1), 3);
+        assert_eq!(app.step_over_models(3, 1), 4);
+        assert_eq!(app.step_over_models(4, 1), 0);
+        // 反向：从 d 退一页直达 a
+        assert_eq!(app.step_over_models(3, -1), 0);
+        assert_eq!(app.step_over_models(0, -1), 4);
+
+        // 全是模型时原地不动（调用方据此提前返回）
+        app.image_files = vec![PathBuf::from("x.obj"), PathBuf::from("y.stl")];
+        assert_eq!(app.step_over_models(0, 1), 0);
+        assert_eq!(app.step_over_models(1, -1), 1);
+    }
+
+    #[allow(clippy::field_reassign_with_default)]
+    #[test]
+    fn comic_next_spread_is_two_real_pages_away() {
+        let mut app = PhotoViewApp::default();
+        app.image_files = ["a.png", "b.png", "c.obj", "d.png", "e.png", "f.png"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        app.current_index = 0;
+
+        // 复刻 next_img 漫画分支：左图 a → 下一副左图应是 d（越过模型 c）
+        let a = app.step_over_models(app.current_index, 1);
+        let next_idx = app.step_over_models(a, 1);
+        assert_eq!(next_idx, 3);
+
+        // prev 分支镜像：从 d 回退应回到 a
+        let p = app.step_over_models(next_idx, -1);
+        assert_eq!(app.step_over_models(p, -1), 0);
     }
 }
