@@ -2313,9 +2313,15 @@ impl eframe::App for PhotoViewApp {
         if self.should_close_next_frame
             && !ctx.input(|i| i.pointer.button_down(egui::PointerButton::Secondary))
         {
-            self.settings.save();
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
+            if self.show_settings {
+                // 设置面板打开时：右键只关面板，不退出程序
+                self.show_settings = false;
+                self.should_close_next_frame = false;
+            } else {
+                self.settings.save();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
+            }
         }
         // 延迟 resize：翻页停止后调整窗口
 
