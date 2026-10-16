@@ -7,15 +7,13 @@ use glam::{Mat4, Vec3};
 use std::path::Path;
 
 pub const MODEL_EXTS: &[&str] = &[
-    "obj", "stl", "gltf", "glb", "ply", "off", "3ds", "dae", "vtk", "wrl", "vrml", "amf",
-    "3mf", "gcode", "gco", "g",
-    "vrm", "fbx", "pmx", "pmd",
-    "usd", "usda", "usdc", "usdz",
+    "obj", "stl", "gltf", "glb", "ply", "off", "3ds", "dae", "vtk", "wrl", "vrml", "amf", "3mf",
+    "gcode", "gco", "g", "vrm", "fbx", "pmx", "pmd", "usd", "usda", "usdc", "usdz",
 ];
 
 pub const UNSUPPORTED_3D_EXTS: &[&str] = &[
-    "blend", "step", "stp", "iges", "igs", "3dm", "c4d", "max", "skp", "sat", "x_t", "x_b",
-    "prt", "sldprt", "sldasm", "ipt", "catpart", "3dxml", "abc",
+    "blend", "step", "stp", "iges", "igs", "3dm", "c4d", "max", "skp", "sat", "x_t", "x_b", "prt",
+    "sldprt", "sldasm", "ipt", "catpart", "3dxml", "abc",
 ];
 
 pub fn is_model_path(path: &Path) -> bool {
@@ -80,9 +78,12 @@ impl Mesh {
             return;
         }
         let mut normals = vec![[0.0f32; 3]; self.positions.len()];
-        for tri in self.indices.chunks_exact(3) {
+        for tri in self.indices.as_chunks::<3>().0 {
             let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
-            if i0 >= self.positions.len() || i1 >= self.positions.len() || i2 >= self.positions.len() {
+            if i0 >= self.positions.len()
+                || i1 >= self.positions.len()
+                || i2 >= self.positions.len()
+            {
                 continue;
             }
             let p0 = Vec3::from(self.positions[i0]);
@@ -116,7 +117,9 @@ impl Mesh {
         }
         if other.normals.len() == other.positions.len() {
             for n in &other.normals {
-                let v = normal_mat.transform_vector3(Vec3::from(*n)).normalize_or_zero();
+                let v = normal_mat
+                    .transform_vector3(Vec3::from(*n))
+                    .normalize_or_zero();
                 self.normals.push([v.x, v.y, v.z]);
             }
         } else {
@@ -127,10 +130,14 @@ impl Mesh {
         match (&mut self.colors, &other.colors) {
             (Some(acc), Some(cols)) => acc.extend_from_slice(cols),
             (Some(acc), None) => {
-                acc.extend(std::iter::repeat([0.78, 0.80, 0.84]).take(other.positions.len()));
+                acc.extend(std::iter::repeat_n(
+                    [0.78, 0.80, 0.84],
+                    other.positions.len(),
+                ));
             }
             (None, Some(cols)) => {
-                let mut acc = vec![[0.78, 0.80, 0.84]; self.positions.len() - other.positions.len()];
+                let mut acc =
+                    vec![[0.78, 0.80, 0.84]; self.positions.len() - other.positions.len()];
                 acc.extend_from_slice(cols);
                 self.colors = Some(acc);
             }
@@ -205,8 +212,8 @@ impl OrbitCamera {
 
     pub fn zoom_by(&mut self, scroll_y: f32) {
         let factor = if scroll_y > 0.0 { 0.88 } else { 1.14 };
-        self.distance =
-            (self.distance * factor).clamp(self.default_distance * 0.05, self.default_distance * 8.0);
+        self.distance = (self.distance * factor)
+            .clamp(self.default_distance * 0.05, self.default_distance * 8.0);
     }
 
     pub fn view_matrix(&self) -> Mat4 {
@@ -362,18 +369,28 @@ fn load_obj(path: &Path) -> anyhow::Result<Mesh> {
         }
         let positions: Vec<[f32; 3]> = mesh
             .positions
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|c| [c[0], c[1], c[2]])
             .collect();
         let normals: Vec<[f32; 3]> = if mesh.normals.len() == mesh.positions.len() {
-            mesh.normals.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect()
+            mesh.normals
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|c| [c[0], c[1], c[2]])
+                .collect()
         } else {
             Vec::new()
         };
-        let colors = mesh.material_id.and_then(|id| materials.get(id)).map(|mat| {
-            let d = mat.diffuse.unwrap_or([0.78, 0.80, 0.84]);
-            vec![d; positions.len()]
-        });
+        let colors = mesh
+            .material_id
+            .and_then(|id| materials.get(id))
+            .map(|mat| {
+                let d = mat.diffuse.unwrap_or([0.78, 0.80, 0.84]);
+                vec![d; positions.len()]
+            });
         let mut piece = Mesh {
             positions,
             normals,
@@ -429,8 +446,10 @@ fn load_gltf(path: &Path) -> anyhow::Result<Mesh> {
                     Some(iter) => iter.collect(),
                     None => continue,
                 };
-                let normals: Vec<[f32; 3]> =
-                    reader.read_normals().map(|i| i.collect()).unwrap_or_default();
+                let normals: Vec<[f32; 3]> = reader
+                    .read_normals()
+                    .map(|i| i.collect())
+                    .unwrap_or_default();
                 let colors: Option<Vec<[f32; 3]>> =
                     reader.read_colors(0).map(|c| c.into_rgb_f32().collect());
                 let indices: Vec<u32> = match reader.read_indices() {
@@ -596,8 +615,13 @@ fn load_ply(path: &Path) -> anyhow::Result<Mesh> {
     let ir = prop_index("red").or_else(|| prop_index("r"));
     let ig = prop_index("green").or_else(|| prop_index("g"));
     let ib = prop_index("blue").or_else(|| prop_index("b"));
-    let scale_color =
-        |v: f32| if v > 1.0 { (v / 255.0).clamp(0.0, 1.0) } else { v.clamp(0.0, 1.0) };
+    let scale_color = |v: f32| {
+        if v > 1.0 {
+            (v / 255.0).clamp(0.0, 1.0)
+        } else {
+            v.clamp(0.0, 1.0)
+        }
+    };
 
     let body = data.get(header_end..).unwrap_or(&[]);
     let mut positions = Vec::with_capacity(vertex_count);
@@ -612,7 +636,9 @@ fn load_ply(path: &Path) -> anyhow::Result<Mesh> {
         let text = String::from_utf8_lossy(body);
         let mut iter = text.lines().filter(|l| !l.trim().is_empty());
         for _ in 0..vertex_count {
-            let line = iter.next().ok_or_else(|| anyhow::anyhow!("PLY 顶点数据不足"))?;
+            let line = iter
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("PLY 顶点数据不足"))?;
             let vals: Vec<&str> = line.split_whitespace().collect();
             let get = |i: usize| -> f32 { vals.get(i).and_then(|s| s.parse().ok()).unwrap_or(0.0) };
             positions.push([get(ix), get(iy), get(iz)]);
@@ -625,7 +651,9 @@ fn load_ply(path: &Path) -> anyhow::Result<Mesh> {
             }
         }
         for _ in 0..face_count {
-            let line = iter.next().ok_or_else(|| anyhow::anyhow!("PLY 面数据不足"))?;
+            let line = iter
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("PLY 面数据不足"))?;
             let parts: Vec<&str> = line.split_whitespace().collect();
             let n: usize = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
             if parts.len() < 1 + n {
@@ -690,7 +718,9 @@ fn load_off(path: &Path) -> anyhow::Result<Mesh> {
     let (nv, nf) = if pending.len() >= 2 {
         (pending[0], pending[1])
     } else {
-        let line = lines.next().ok_or_else(|| anyhow::anyhow!("OFF 缺少计数行"))?;
+        let line = lines
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("OFF 缺少计数行"))?;
         let parts: Vec<usize> = line
             .split_whitespace()
             .filter_map(|s| s.parse().ok())
@@ -703,7 +733,9 @@ fn load_off(path: &Path) -> anyhow::Result<Mesh> {
 
     let mut positions = Vec::with_capacity(nv);
     for _ in 0..nv {
-        let line = lines.next().ok_or_else(|| anyhow::anyhow!("OFF 顶点不足"))?;
+        let line = lines
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("OFF 顶点不足"))?;
         let vals: Vec<f32> = line
             .split_whitespace()
             .filter_map(|s| s.parse().ok())
@@ -934,7 +966,9 @@ fn extract_float_array(block: &str) -> Option<Vec<f32>> {
     let lower = block.to_ascii_lowercase();
     let start = lower.find("<float_array")?;
     let content_start = lower[start..].find('>').map(|i| start + i + 1)?;
-    let content_end = lower[content_start..].find("</float_array>").map(|i| content_start + i)?;
+    let content_end = lower[content_start..]
+        .find("</float_array>")
+        .map(|i| content_start + i)?;
     Some(
         block[content_start..content_end]
             .split_whitespace()
@@ -1071,7 +1105,11 @@ fn parse_dae_mesh_block(block: &str, block_l: &str) -> Option<(Vec<[f32; 3]>, Ve
                             tb[start..].find("</vcount>").map(|e| &tb[start..start + e])
                         });
                     let counts: Vec<usize> = vc
-                        .map(|t| t.split_whitespace().filter_map(|s| s.parse().ok()).collect())
+                        .map(|t| {
+                            t.split_whitespace()
+                                .filter_map(|s| s.parse().ok())
+                                .collect()
+                        })
                         .unwrap_or_default();
                     let mut cursor = 0usize;
                     for &c in &counts {
@@ -1101,7 +1139,12 @@ fn parse_dae_mesh_block(block: &str, block_l: &str) -> Option<(Vec<[f32; 3]>, Ve
         }
     }
 
-    let positions: Vec<[f32; 3]> = raw.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+    let positions: Vec<[f32; 3]> = raw
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|c| [c[0], c[1], c[2]])
+        .collect();
     let n = positions.len();
     indices.retain(|i| (*i as usize) < n);
     if positions.is_empty() || indices.is_empty() {
@@ -1144,18 +1187,24 @@ fn load_vtk(path: &Path) -> anyhow::Result<Mesh> {
         }
         match section.as_str() {
             "points" => {
-                let vals: Vec<f32> = l.split_whitespace().filter_map(|s| s.parse().ok()).collect();
-                for c in vals.chunks_exact(3) {
+                let vals: Vec<f32> = l
+                    .split_whitespace()
+                    .filter_map(|s| s.parse().ok())
+                    .collect();
+                for c in vals.as_chunks::<3>().0 {
                     positions.push([c[0], c[1], c[2]]);
                 }
             }
             "polys" => {
-                let nums: Vec<u32> = l.split_whitespace().filter_map(|s| s.parse().ok()).collect();
+                let nums: Vec<u32> = l
+                    .split_whitespace()
+                    .filter_map(|s| s.parse().ok())
+                    .collect();
                 if nums.is_empty() {
                     continue;
                 }
                 let n = nums[0] as usize;
-                if nums.len() >= 1 + n {
+                if nums.len() > n {
                     fan_triangles(&mut indices, &nums[1..=n]);
                 }
             }
@@ -1184,7 +1233,11 @@ fn load_wrl(path: &Path) -> anyhow::Result<Mesh> {
                     .split(|c: char| c.is_whitespace() || c == ',')
                     .filter_map(|t| t.trim().parse().ok())
                     .collect();
-                nums.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect()
+                nums.as_chunks::<3>()
+                    .0
+                    .iter()
+                    .map(|c| [c[0], c[1], c[2]])
+                    .collect()
             }
             _ => Vec::new(),
         }
@@ -1239,7 +1292,10 @@ fn load_amf(path: &Path) -> anyhow::Result<Mesh> {
             let get = |name: &str| -> Option<f32> {
                 let t = find_tag(cl, name, 0)?;
                 let e = find_close_tag(cl, name, t).unwrap_or(cl.len());
-                chunk[t.min(chunk.len())..e.min(chunk.len())].trim().parse().ok()
+                chunk[t.min(chunk.len())..e.min(chunk.len())]
+                    .trim()
+                    .parse()
+                    .ok()
             };
             if let (Some(x), Some(y), Some(z)) = (get("x"), get("y"), get("z")) {
                 positions.push([x, y, z]);
@@ -1254,7 +1310,10 @@ fn load_amf(path: &Path) -> anyhow::Result<Mesh> {
             let get_u = |name: &str| -> Option<u32> {
                 let t = find_tag(cl, name, 0)?;
                 let e = find_close_tag(cl, name, t).unwrap_or(cl.len());
-                chunk[t.min(chunk.len())..e.min(chunk.len())].trim().parse().ok()
+                chunk[t.min(chunk.len())..e.min(chunk.len())]
+                    .trim()
+                    .parse()
+                    .ok()
             };
             if let (Some(a), Some(b), Some(c)) = (get_u("v1"), get_u("v2"), get_u("v3")) {
                 indices.extend_from_slice(&[base + a, base + b, base + c]);
@@ -1378,7 +1437,7 @@ fn instantiate_3mf(xml: &str, out: &mut Mesh) -> bool {
             inst_3mf(&objects, id, *xf, out, 0);
         }
     } else {
-        for (id, _) in &objects {
+        for id in objects.keys() {
             inst_3mf(&objects, id, Mat4::IDENTITY, out, 0);
         }
     }
@@ -1519,10 +1578,10 @@ fn load_gcode(path: &Path) -> anyhow::Result<Mesh> {
             "M83" => absolute_e = false,
             "G92" => {
                 for p in parts {
-                    if let Some(v) = p.strip_prefix('E').or_else(|| p.strip_prefix('e')) {
-                        if let Ok(v) = v.parse::<f32>() {
-                            cur.e = v;
-                        }
+                    if let Some(v) = p.strip_prefix('E').or_else(|| p.strip_prefix('e'))
+                        && let Ok(v) = v.parse::<f32>()
+                    {
+                        cur.e = v;
                     }
                 }
             }
@@ -1707,7 +1766,12 @@ fn load_fbx_ascii(text: &str) -> anyhow::Result<Mesh> {
     if flat.len() < 9 || indices.is_empty() {
         anyhow::bail!("FBX 中未解析到网格，请导出为 OBJ/GLB/STL");
     }
-    let verts: Vec<[f32; 3]> = flat.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+    let verts: Vec<[f32; 3]> = flat
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|c| [c[0], c[1], c[2]])
+        .collect();
     let n = verts.len() as u32;
     indices.retain(|i| *i < n);
     if indices.is_empty() {
@@ -1747,29 +1811,34 @@ fn load_fbx_binary(data: &[u8]) -> anyhow::Result<Mesh> {
     };
     let mut positions = Vec::new();
     let mut indices = Vec::new();
-    if let Some(pos) = find_bytes(data, b"Vertices") {
-        if let Some(arr) = extract_fbx_bin_array_f64(data, pos) {
-            positions = arr;
-        }
+    if let Some(pos) = find_bytes(data, b"Vertices")
+        && let Some(arr) = extract_fbx_bin_array_f64(data, pos)
+    {
+        positions = arr;
     }
-    if let Some(pos) = find_bytes(data, b"PolygonVertexIndex") {
-        if let Some(arr) = extract_fbx_bin_array_i32(data, pos) {
-            let mut poly = Vec::new();
-            for v in arr {
-                if v < 0 {
-                    poly.push((-v - 1) as u32);
-                    fan_triangles(&mut indices, &poly);
-                    poly.clear();
-                } else {
-                    poly.push(v as u32);
-                }
+    if let Some(pos) = find_bytes(data, b"PolygonVertexIndex")
+        && let Some(arr) = extract_fbx_bin_array_i32(data, pos)
+    {
+        let mut poly = Vec::new();
+        for v in arr {
+            if v < 0 {
+                poly.push((-v - 1) as u32);
+                fan_triangles(&mut indices, &poly);
+                poly.clear();
+            } else {
+                poly.push(v as u32);
             }
         }
     }
     if positions.len() < 9 || indices.is_empty() {
         anyhow::bail!("二进制 FBX 暂无法可靠解析，请导出为 OBJ/GLB/STL");
     }
-    let verts: Vec<[f32; 3]> = positions.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+    let verts: Vec<[f32; 3]> = positions
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|c| [c[0], c[1], c[2]])
+        .collect();
     let n = verts.len() as u32;
     indices.retain(|i| *i < n);
     Ok(Mesh::from_positions_indices(verts, indices, None))
@@ -1783,7 +1852,7 @@ fn extract_fbx_bin_array_f64(data: &[u8], name_at: usize) -> Option<Vec<f32>> {
             break;
         }
         let len = u32::from_le_bytes(data[p..p + 4].try_into().ok()?) as usize;
-        if len < 9 || len > 50_000_000 {
+        if !(9..=50_000_000).contains(&len) {
             continue;
         }
         let enc = u32::from_le_bytes(data[p + 4..p + 8].try_into().ok()?);
@@ -1813,7 +1882,7 @@ fn extract_fbx_bin_array_i32(data: &[u8], name_at: usize) -> Option<Vec<i32>> {
             break;
         }
         let len = u32::from_le_bytes(data[p..p + 4].try_into().ok()?) as usize;
-        if len < 3 || len > 80_000_000 {
+        if !(3..=80_000_000).contains(&len) {
             continue;
         }
         let enc = u32::from_le_bytes(data[p + 4..p + 8].try_into().ok()?);
@@ -1950,7 +2019,7 @@ fn parse_pmx(data: &[u8]) -> anyhow::Result<Mesh> {
     let fcount = u32::from_le_bytes(data[off..off + 4].try_into()?) as usize;
     off += 4;
     let mut indices = Vec::with_capacity(fcount.min(6_000_000));
-    let mut read_idx = |off: &mut usize| -> Option<u32> {
+    let read_idx = |off: &mut usize| -> Option<u32> {
         match vidx_sz {
             1 => {
                 let v = *data.get(*off)?;
@@ -2041,12 +2110,11 @@ fn load_usdz(path: &Path) -> anyhow::Result<Mesh> {
     names.sort();
     for name in names {
         let mut s = String::new();
-        if let Ok(mut z) = archive.by_name(&name) {
-            if std::io::Read::read_to_string(&mut z, &mut s).is_ok() {
-                if let Ok(m) = parse_usda(&s) {
-                    return Ok(m);
-                }
-            }
+        if let Ok(mut z) = archive.by_name(&name)
+            && std::io::Read::read_to_string(&mut z, &mut s).is_ok()
+            && let Ok(m) = parse_usda(&s)
+        {
+            return Ok(m);
         }
     }
     anyhow::bail!("USDZ 中未找到可解析的 usda 网格")
@@ -2062,44 +2130,42 @@ fn parse_usda(text: &str) -> anyhow::Result<Mesh> {
     let mut search = 0usize;
     while let Some(i) = lower[search..].find("point3f[] points") {
         let abs = search + i;
-        if let Some(start) = lower[abs..].find('[').map(|j| abs + j + 1) {
-            if let Some(end) = find_matching_bracket(&lower, start - 1) {
-                let body = &text[start..end];
-                for tup in body.split(',') {
-                    let nums: Vec<f32> = tup
-                        .trim()
-                        .trim_matches(|c| c == '(' || c == ')')
-                        .split_whitespace()
-                        .filter_map(|s| s.parse().ok())
-                        .collect();
-                    if nums.len() >= 3 {
-                        positions.push([nums[0], nums[1], nums[2]]);
-                    }
+        if let Some(start) = lower[abs..].find('[').map(|j| abs + j + 1)
+            && let Some(end) = find_matching_bracket(&lower, start - 1)
+        {
+            let body = &text[start..end];
+            for tup in body.split(',') {
+                let nums: Vec<f32> = tup
+                    .trim()
+                    .trim_matches(|c| c == '(' || c == ')')
+                    .split_whitespace()
+                    .filter_map(|s| s.parse().ok())
+                    .collect();
+                if nums.len() >= 3 {
+                    positions.push([nums[0], nums[1], nums[2]]);
                 }
             }
         }
         search = abs + 8;
     }
 
-    if let Some(i) = lower.find("facevertexcounts") {
-        if let Some(start) = lower[i..].find('[').map(|j| i + j + 1) {
-            if let Some(end) = find_matching_bracket(&lower, start - 1) {
-                face_counts = text[start..end]
-                    .split(|c: char| c == ',' || c.is_whitespace())
-                    .filter_map(|s| s.trim().parse().ok())
-                    .collect();
-            }
-        }
+    if let Some(i) = lower.find("facevertexcounts")
+        && let Some(start) = lower[i..].find('[').map(|j| i + j + 1)
+        && let Some(end) = find_matching_bracket(&lower, start - 1)
+    {
+        face_counts = text[start..end]
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
     }
-    if let Some(i) = lower.find("facevertexindices") {
-        if let Some(start) = lower[i..].find('[').map(|j| i + j + 1) {
-            if let Some(end) = find_matching_bracket(&lower, start - 1) {
-                face_indices = text[start..end]
-                    .split(|c: char| c == ',' || c.is_whitespace())
-                    .filter_map(|s| s.trim().parse().ok())
-                    .collect();
-            }
-        }
+    if let Some(i) = lower.find("facevertexindices")
+        && let Some(start) = lower[i..].find('[').map(|j| i + j + 1)
+        && let Some(end) = find_matching_bracket(&lower, start - 1)
+    {
+        face_indices = text[start..end]
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
     }
 
     if !face_counts.is_empty() && !face_indices.is_empty() {
@@ -2112,7 +2178,7 @@ fn parse_usda(text: &str) -> anyhow::Result<Mesh> {
             cur += c;
         }
     } else if !face_indices.is_empty() {
-        for tri in face_indices.chunks_exact(3) {
+        for tri in face_indices.as_chunks::<3>().0 {
             indices.extend_from_slice(tri);
         }
     }
@@ -2168,7 +2234,9 @@ pub fn render_mesh_ex(
     let h = height.max(2);
     let mut pixels = vec![Color32::from_rgb(30, 32, 38); w * h];
     let mut depth = vec![f32::INFINITY; w * h];
-    pixels.iter_mut().for_each(|p| *p = Color32::from_rgb(32, 34, 40));
+    pixels
+        .iter_mut()
+        .for_each(|p| *p = Color32::from_rgb(32, 34, 40));
 
     if mesh.positions.is_empty() || mesh.indices.is_empty() {
         return pixels;
@@ -2190,17 +2258,21 @@ pub fn render_mesh_ex(
     let ll = (lx * lx + ly * ly + lz * lz).sqrt();
     let (lx, ly, lz) = (lx / ll, ly / ll, lz / ll);
 
-    let max_tris = if fast { MAX_RENDER_TRIS_FAST } else { MAX_RENDER_TRIS_HQ };
+    let max_tris = if fast {
+        MAX_RENDER_TRIS_FAST
+    } else {
+        MAX_RENDER_TRIS_HQ
+    };
     let tri_total = mesh.indices.len() / 3;
     let stride = if tri_total > max_tris {
-        ((tri_total + max_tris - 1) / max_tris).max(2)
+        tri_total.div_ceil(max_tris).max(2)
     } else {
         1
     };
     let default_col = [0.88f32, 0.90, 0.93];
     let ambient = 0.42f32;
 
-    for (tri_i, tri) in mesh.indices.chunks_exact(3).enumerate() {
+    for (tri_i, tri) in mesh.indices.as_chunks::<3>().0.iter().enumerate() {
         if stride > 1 && (tri_i % stride) != 0 {
             continue;
         }
@@ -2416,7 +2488,12 @@ mod tests {
             .iter()
             .filter(|p| **p != bg && (p.r() > 50 || p.g() > 50 || p.b() > 50))
             .count();
-        assert!(body > 120 * 120 / 8, "silhouette too sparse: {}/{}", body, 120 * 120);
+        assert!(
+            body > 120 * 120 / 8,
+            "silhouette too sparse: {}/{}",
+            body,
+            120 * 120
+        );
     }
 
     #[test]

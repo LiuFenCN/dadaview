@@ -6,10 +6,7 @@ edition = "2024"
 [dependencies]
 eframe = "0.28"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "tiff", "gif", "ico"] }
-log = "0.4"
-env_logger = "0.11"
 rfd = "0.14"
-directories = "5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
@@ -25,7 +22,11 @@ pollster = "0.3"
 bytemuck = { version = "1.14", features = ["derive"] }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_UI_Controls", "Win32_UI_HiDpi", "Win32_System_LibraryLoader", "Win32_UI_Shell", "Win32_System_Threading", "Win32_System_Pipes", "Win32_System_IO", "Win32_Storage_FileSystem", "Win32_Security"] }
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Dwm", "Win32_UI_Shell"] }
+
+[profile.dev]
+# debug 下 image/wgpu 解码渲染极慢，轻微优化换取可用手感（编译开销增加很小）
+opt-level = 1
 
 [profile.release]
 opt-level = 3

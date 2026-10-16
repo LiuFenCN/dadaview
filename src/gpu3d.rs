@@ -104,7 +104,8 @@ impl GpuRenderer {
             &wgpu::DeviceDescriptor {
                 label: Some("photoview-3d"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
+                required_limits:
+                    wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
             },
             None,
         ))
@@ -287,11 +288,7 @@ impl GpuRenderer {
         let default_col = [0.88f32, 0.90, 0.93];
         let mut verts = Vec::with_capacity(mesh.positions.len());
         for (i, p) in mesh.positions.iter().enumerate() {
-            let n = mesh
-                .normals
-                .get(i)
-                .copied()
-                .unwrap_or([0.0, 1.0, 0.0]);
+            let n = mesh.normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0]);
             let c = mesh
                 .colors
                 .as_ref()
@@ -313,16 +310,22 @@ impl GpuRenderer {
             self.index_count = 0;
             return;
         }
-        self.vertex_buf = Some(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("vb"),
-            contents: bytemuck::cast_slice(&verts),
-            usage: wgpu::BufferUsages::VERTEX,
-        }));
-        self.index_buf = Some(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("ib"),
-            contents: bytemuck::cast_slice(&indices),
-            usage: wgpu::BufferUsages::INDEX,
-        }));
+        self.vertex_buf = Some(
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("vb"),
+                    contents: bytemuck::cast_slice(&verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }),
+        );
+        self.index_buf = Some(
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("ib"),
+                    contents: bytemuck::cast_slice(&indices),
+                    usage: wgpu::BufferUsages::INDEX,
+                }),
+        );
         self.index_count = indices.len() as u32;
         self.mesh_key = key;
     }
@@ -346,13 +349,12 @@ impl GpuRenderer {
             light_dir: [0.45, 0.85, 0.35, 0.0],
             eye: [eye.x, eye.y, eye.z, 1.0],
         };
-        self.queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+        self.queue
+            .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
 
         let mut encoder = self
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("enc"),
-            });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("enc") });
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -384,7 +386,10 @@ impl GpuRenderer {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_vertex_buffer(0, self.vertex_buf.as_ref()?.slice(..));
-            pass.set_index_buffer(self.index_buf.as_ref()?.slice(..), wgpu::IndexFormat::Uint32);
+            pass.set_index_buffer(
+                self.index_buf.as_ref()?.slice(..),
+                wgpu::IndexFormat::Uint32,
+            );
             pass.draw_indexed(0..self.index_count, 0, 0..1);
         }
 
@@ -428,7 +433,7 @@ impl GpuRenderer {
         let tight = (w * 4) as usize;
         for y in 0..h as usize {
             let row = &data[y * bytes_per_row as usize..y * bytes_per_row as usize + tight];
-            for px in row.chunks_exact(4) {
+            for px in row.as_chunks::<4>().0 {
                 // srgb 目标已是最终 0-255 显示值
                 pixels.push(Color32::from_rgba_unmultiplied(px[0], px[1], px[2], 255));
             }
@@ -442,7 +447,7 @@ impl GpuRenderer {
 fn aligned_bytes_per_row(width: u32) -> u32 {
     let unpadded = width * 4;
     let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-    (unpadded + align - 1) / align * align
+    unpadded.div_ceil(align) * align
 }
 
 /// 供调用方做 mesh 指纹，避免无意义重传
