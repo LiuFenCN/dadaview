@@ -85,7 +85,11 @@ struct PhotoViewApp {
 
     loaded_next: Arc<Mutex<Option<PreloadedImage>>>,
 
+    loaded_next2: Arc<Mutex<Option<PreloadedImage>>>,
+
     loaded_prev: Arc<Mutex<Option<PreloadedImage>>>,
+
+    loaded_prev2: Arc<Mutex<Option<PreloadedImage>>>,
 
     is_loading: bool,
 
@@ -203,7 +207,11 @@ impl Default for PhotoViewApp {
 
             loaded_next: Arc::new(Mutex::new(None)),
 
+            loaded_next2: Arc::new(Mutex::new(None)),
+
             loaded_prev: Arc::new(Mutex::new(None)),
+
+            loaded_prev2: Arc::new(Mutex::new(None)),
 
             is_loading: false,
 
@@ -1053,6 +1061,55 @@ impl PhotoViewApp {
         }
     }
 
+    /// 重排一个方向的两个槽位：优先复用已命中新目标的预加载图，缺的再异步补
+    fn refill_dir(
+        near: &Arc<Mutex<Option<PreloadedImage>>>,
+        far: &Arc<Mutex<Option<PreloadedImage>>>,
+        t_near: Option<PathBuf>,
+        t_far: Option<PathBuf>,
+    ) {
+        let mut cands: Vec<PreloadedImage> = near
+            .lock()
+            .unwrap()
+            .take()
+            .into_iter()
+            .chain(far.lock().unwrap().take())
+            .collect();
+
+        let mut reuse = |t: &Option<PathBuf>| -> Option<PreloadedImage> {
+            let t = t.as_ref()?;
+
+            let idx = cands.iter().position(|c| &c.path == t)?;
+
+            Some(cands.remove(idx))
+        };
+
+        let n = reuse(&t_near);
+
+        let f = reuse(&t_far);
+
+        let n_missing = n.is_none();
+
+        let f_missing = f.is_none();
+
+        let far_dup_of_near = t_far.is_some() && t_far.as_deref() == t_near.as_deref();
+
+        *near.lock().unwrap() = n;
+
+        *far.lock().unwrap() = f;
+
+        if n_missing && let Some(p) = t_near {
+            preload_async(p, near.clone());
+        }
+
+        if f_missing
+            && !far_dup_of_near
+            && let Some(p) = t_far
+        {
+            preload_async(p, far.clone());
+        }
+    }
+
     fn preload_neighbors(&mut self) {
         if self.image_files.is_empty() {
             return;
@@ -1062,19 +1119,29 @@ impl PhotoViewApp {
 
         let step = if self.comic_mode { 2 } else { 1 };
 
-        let next_idx = (self.current_index + step) % l;
+        let cur = self.current_path.clone();
 
-        let prev_idx = (self.current_index + l - step) % l;
+        // 3D 模型与当前图不预加载
+        let target_at = |delta: isize| -> Option<PathBuf> {
+            let idx = (self.current_index as isize + delta * step as isize).rem_euclid(l as isize)
+                as usize;
 
-        // 3D 模型不走图片预加载
+            let p = &self.image_files[idx];
 
-        if !mesh3d::is_model_path(&self.image_files[next_idx]) {
-            preload_async(self.image_files[next_idx].clone(), self.loaded_next.clone());
-        }
+            (!mesh3d::is_model_path(p) && Some(p.as_path()) != cur.as_deref()).then(|| p.clone())
+        };
 
-        if !mesh3d::is_model_path(&self.image_files[prev_idx]) {
-            preload_async(self.image_files[prev_idx].clone(), self.loaded_prev.clone());
-        }
+        let near_next = target_at(1);
+
+        let far_next = target_at(2);
+
+        let near_prev = target_at(-1);
+
+        let far_prev = target_at(-2);
+
+        Self::refill_dir(&self.loaded_next, &self.loaded_next2, near_next, far_next);
+
+        Self::refill_dir(&self.loaded_prev, &self.loaded_prev2, near_prev, far_prev);
     }
 
     /// 根据图片尺寸和 monitor 上限计算 fit zoom（不依赖当前窗口大小）

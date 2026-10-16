@@ -5,6 +5,7 @@ use egui::Color32;
 use image::imageops::FilterType;
 use image::{AnimationDecoder, DynamicImage};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -253,8 +254,38 @@ pub(crate) fn load_gif_frames(path: &PathBuf, dest: Arc<Mutex<Option<Vec<AnimFra
     }
 }
 
+/// 预加载最多同时运行的线程数，避免快速翻页时打满磁盘与 CPU
+const MAX_PRELOAD_THREADS: u32 = 2;
+
+static PRELOAD_INFLIGHT: AtomicU32 = AtomicU32::new(0);
+
+struct PreloadGuard;
+
+impl Drop for PreloadGuard {
+    fn drop(&mut self) {
+        PRELOAD_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub(crate) fn preload_async(path: PathBuf, dest: Arc<Mutex<Option<PreloadedImage>>>) {
+    loop {
+        let cur = PRELOAD_INFLIGHT.load(Ordering::Relaxed);
+
+        if cur >= MAX_PRELOAD_THREADS {
+            return;
+        }
+
+        if PRELOAD_INFLIGHT
+            .compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            break;
+        }
+    }
+
     thread::spawn(move || {
+        let _guard = PreloadGuard;
+
         if let Ok(img) = open_image_robust(&path) {
             let orig_w = img.width() as usize;
 
