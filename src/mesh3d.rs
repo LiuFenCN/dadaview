@@ -1552,7 +1552,7 @@ fn load_gcode(path: &Path) -> anyhow::Result<Mesh> {
     };
     let mut absolute = true;
     let mut absolute_e = true;
-    let mut extruding = false;
+    let mut extruding;
     let mut positions: Vec<[f32; 3]> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
     let mut half_w = 0.2f32;

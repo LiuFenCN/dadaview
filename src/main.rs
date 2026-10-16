@@ -52,13 +52,11 @@ const SUPPORTED_EXTS: &[&str] = &[
 ];
 
 /// 计算 2cm 对应的像素值（适配 DPI 缩放）
-
 fn mini_size_pp(ppi: f32) -> f32 {
     (2.0 * 96.0 / 2.54 * ppi).round()
 }
 
 /// 人类可读文件大小
-
 fn human_size(bytes: u64) -> String {
     const KB: u64 = 1024;
 
@@ -74,7 +72,6 @@ fn human_size(bytes: u64) -> String {
 }
 
 /// 获取 exe 所在目录
-
 fn exe_dir() -> PathBuf {
     std::env::current_exe()
         .unwrap_or_default()
@@ -204,7 +201,6 @@ fn drag_binding_label(code: &str) -> String {
 }
 
 /// 将 egui Key 转为可读字符串
-
 fn key_to_string(key: egui::Key) -> String {
     match key {
         egui::Key::ArrowLeft => "ArrowLeft".into(),
@@ -220,7 +216,6 @@ fn key_to_string(key: egui::Key) -> String {
 }
 
 /// 将字符串解析回 egui::Key（部分支持）
-
 fn string_to_key(s: &str) -> Option<egui::Key> {
     match s {
         "ArrowLeft" => Some(egui::Key::ArrowLeft),
@@ -340,6 +335,8 @@ impl AppSettings {
 // ─── 图片数据 ───────────────────────────────────────
 
 struct PendingImage {
+    path: PathBuf,
+
     pixels: Vec<Color32>,
 
     tex_w: usize,
@@ -354,6 +351,8 @@ struct PendingImage {
 #[derive(Clone)]
 
 struct PreloadedImage {
+    path: PathBuf,
+
     tex_w: usize,
 
     tex_h: usize,
@@ -366,7 +365,6 @@ struct PreloadedImage {
 }
 
 /// 动画帧
-
 struct AnimFrame {
     pixels: Vec<Color32>,
 
@@ -376,6 +374,8 @@ struct AnimFrame {
 
     delay_ms: u32, // 帧延迟（毫秒）
 }
+
+type ModelRenderResult = (usize, usize, Vec<Color32>, bool);
 
 // ─── 主应用 ───────────────────────────────────────
 
@@ -396,6 +396,8 @@ struct PhotoViewApp {
     current_path: Option<PathBuf>,
 
     image_files: Vec<PathBuf>,
+
+    last_scanned_dir: Option<PathBuf>,
 
     current_index: usize,
 
@@ -469,7 +471,7 @@ struct PhotoViewApp {
     middle_down: bool,
     middle_moved: bool,
     // 异步渲染
-    model_render_out: Arc<Mutex<Option<(usize, usize, Vec<Color32>, bool)>>>,
+    model_render_out: Arc<Mutex<Option<ModelRenderResult>>>,
     model_render_busy: bool,
     model_render_wanted: Option<(usize, usize)>,
     model_interacting: bool,
@@ -511,6 +513,7 @@ impl Default for PhotoViewApp {
             current_path: None,
 
             image_files: Vec::new(),
+            last_scanned_dir: None,
             current_index: 0,
 
             zoom: 1.0,
@@ -617,7 +620,6 @@ fn rgba_to_color32(rgba: &[u8]) -> Vec<Color32> {
 }
 
 /// 把整帧抽成小图，仅用于箭头/UI 自适应配色
-
 fn downsample_for_tint(src: &[Color32], w: usize, h: usize, side: usize) -> Vec<Color32> {
     if w == 0 || h == 0 || src.len() < w * h {
         return src.to_vec();
@@ -641,7 +643,6 @@ fn downsample_for_tint(src: &[Color32], w: usize, h: usize, side: usize) -> Vec<
 }
 
 /// 用内容嗅探打开图片，避免扩展名不匹配导致解码失败（如QQ截图保存为.jpg但实际是PNG）
-
 fn open_image_robust(path: &std::path::Path) -> Result<image::DynamicImage, image::ImageError> {
     // 先尝试按扩展名打开（快）
 
@@ -659,7 +660,6 @@ fn open_image_robust(path: &std::path::Path) -> Result<image::DynamicImage, imag
 }
 
 /// 用内容嗅探获取图片尺寸，避免扩展名不匹配
-
 fn image_dimensions_robust(path: &std::path::Path) -> Result<(u32, u32), image::ImageError> {
     // 先尝试按扩展名
 
@@ -667,13 +667,9 @@ fn image_dimensions_robust(path: &std::path::Path) -> Result<(u32, u32), image::
         Ok(dim) => Ok(dim),
 
         Err(_) => {
-            // 回退：用内容嗅探打开后取尺寸
-
-            let img = image::ImageReader::open(path)?
-                .with_guessed_format()?
-                .decode()?;
-
-            Ok((img.width(), img.height()))
+            // 回退：内容嗅探只读头部取尺寸，避免整图解码卡 UI 线程
+            let reader = image::ImageReader::open(path)?.with_guessed_format()?;
+            reader.into_dimensions()
         }
     }
 }
@@ -700,6 +696,7 @@ fn load_image_async(
             let pixels = rgba_to_color32(&rgba);
 
             *dest.lock().unwrap() = Some(PendingImage {
+                path: path.clone(),
                 pixels,
                 tex_w: tw,
                 tex_h: th,
@@ -715,7 +712,6 @@ fn load_image_async(
 }
 
 /// 异步加载 GIF 所有帧
-
 fn load_gif_frames(path: &PathBuf, dest: Arc<Mutex<Option<Vec<AnimFrame>>>>) {
     use std::fs::File;
 
@@ -732,7 +728,7 @@ fn load_gif_frames(path: &PathBuf, dest: Arc<Mutex<Option<Vec<AnimFrame>>>>) {
                     let delay_ms = {
                         let (n, d) = frame.delay().numer_denom_ms();
 
-                        if d == 0 { 100u32 } else { (n / d) }
+                        if d == 0 { 100u32 } else { n / d }
                     };
 
                     let delay_ms = if delay_ms == 0 { 100 } else { delay_ms };
@@ -800,6 +796,7 @@ fn preload_async(path: PathBuf, dest: Arc<Mutex<Option<PreloadedImage>>>) {
             let pixels = rgba_to_color32(&rgba);
 
             *dest.lock().unwrap() = Some(PreloadedImage {
+                path: path.clone(),
                 tex_w: tw,
                 tex_h: th,
                 pixels,
@@ -811,9 +808,7 @@ fn preload_async(path: PathBuf, dest: Arc<Mutex<Option<PreloadedImage>>>) {
 }
 
 /// 根据纹理像素在指定区域（屏幕坐标）的平均亮度，返回箭头颜色（黑或白）
-
 /// screen_rect 是当前窗口区域，arrow_pos 是箭头中心点
-
 fn adaptive_arrow_color(
     pixels: &[Color32],
     tex_size: [usize; 2],
@@ -911,7 +906,6 @@ fn in_arrow_zone(pos: egui::Pos2, screen: egui::Rect) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-
 fn apply_win11_effects() {
     unsafe {
         let title: Vec<u16> = "PhotoView\0".encode_utf16().collect();
@@ -949,7 +943,6 @@ fn apply_win11_effects() {
 fn apply_win11_effects() {}
 
 /// 注册文件关联到 Windows 注册表（仅 HKCU）
-
 fn register_file_association(exts: &[String], set_default: bool) -> Result<(), String> {
     use winreg::enums::*;
 
@@ -1101,6 +1094,10 @@ impl PhotoViewApp {
         if !dir.is_dir() {
             return;
         }
+        // 同一目录跳过：网络盘/超大目录不重复扫描
+        if self.last_scanned_dir.as_deref() == Some(dir) {
+            return;
+        }
 
         self.image_files.clear();
 
@@ -1117,6 +1114,7 @@ impl PhotoViewApp {
         }
 
         self.image_files.sort();
+        self.last_scanned_dir = Some(dir.to_path_buf());
     }
 
     fn open_image(&mut self, path: PathBuf, ctx: &egui::Context) {
@@ -1249,7 +1247,6 @@ impl PhotoViewApp {
     }
 
     /// 打开 3D 模型文件
-
     fn open_model(&mut self, path: PathBuf, ctx: &egui::Context) {
         self.viewing_3d = true;
 
@@ -1391,8 +1388,13 @@ impl PhotoViewApp {
         }
 
         let maybe_pending = self.pending.lock().unwrap().take();
+        let pending = match maybe_pending {
+            Some(p) if Some(p.path.as_path()) == self.current_path.as_deref() => Some(p),
+            Some(_) => None, // 路径已变：丢弃旧线程结果，防止显示错图
+            None => None,
+        };
 
-        if let Some(pending) = maybe_pending {
+        if let Some(pending) = pending {
             let color_image = egui::ColorImage {
                 size: [pending.tex_w, pending.tex_h],
                 pixels: pending.pixels.clone(),
@@ -1495,7 +1497,6 @@ impl PhotoViewApp {
     }
 
     /// 应用异步加载完成的 3D 模型，并启动/收取后台渲染
-
     fn apply_model_pending(&mut self, ctx: &egui::Context) {
         let now = ctx.input(|i| i.time);
 
@@ -1753,6 +1754,26 @@ impl PhotoViewApp {
         }
     }
 
+    /// 消费槽位仅当路径匹配；不匹配则原样保留，防止旧线程/另一方向的数据写上当前图
+    fn take_slot_if_match<T>(
+        slot: &Arc<Mutex<Option<T>>>,
+        expect: &std::path::Path,
+        get_path: impl Fn(&T) -> &PathBuf,
+    ) -> Option<T> {
+        let mut guard = slot.lock().unwrap();
+        let matched = match &*guard {
+            Some(v) => get_path(v) == expect,
+            None => false,
+        };
+        if matched {
+            let mut take = None;
+            std::mem::swap(&mut *guard, &mut take);
+            take
+        } else {
+            None
+        }
+    }
+
     fn load_comic_second(&mut self, _ctx: &egui::Context) {
         self.comic_second_texture = None;
 
@@ -1772,13 +1793,12 @@ impl PhotoViewApp {
 
         let next_path = self.image_files[next_idx].clone();
 
-        // 先看预加载是否命中
-
-        let maybe_pre = self.loaded_next.lock().unwrap().take();
-
+        // 先看预加载是否命中（路径必须匹配，否则弃用重读）
+        let maybe_pre = Self::take_slot_if_match(&self.loaded_next, &next_path, |p| &p.path);
         if let Some(pre) = maybe_pre {
             *self.pending_second.lock().unwrap() = Some(PendingImage {
-                pixels: pre.pixels.clone(),
+                path: next_path,
+                pixels: pre.pixels,
 
                 tex_w: pre.tex_w,
 
@@ -1822,7 +1842,6 @@ impl PhotoViewApp {
     }
 
     /// 根据图片尺寸和 monitor 上限计算 fit zoom（不依赖当前窗口大小）
-
     fn fit_zoom_for(&self, img_w: usize, img_h: usize, monitor: egui::Vec2) -> f32 {
         if img_w > 0 && img_h > 0 {
             let max_w = monitor.x * 0.85;
@@ -1846,7 +1865,6 @@ impl PhotoViewApp {
     }
 
     /// 设置单图模式的窗口大小（根据 zoom 和图片尺寸）
-
     fn resize_for_single(&self, ctx: &egui::Context) {
         let monitor = ctx.input(|i| {
             i.viewport()
@@ -1866,9 +1884,7 @@ impl PhotoViewApp {
     }
 
     /// 漫画模式 zoom：两张图并排适配窗口
-
     /// 必须与绘制逻辑一致：两张图按各自宽高比缩放到统一 display_h
-
     fn fit_zoom_comic(&mut self, ctx: &egui::Context) {
         let monitor = ctx.input(|i| {
             i.viewport()
@@ -2023,7 +2039,7 @@ impl PhotoViewApp {
 
         *self.anim_pending.lock().unwrap() = None;
 
-        let maybe_pre = self.loaded_next.lock().unwrap().take();
+        let maybe_pre = Self::take_slot_if_match(&self.loaded_next, &path, |p| &p.path);
 
         if let Some(pre) = maybe_pre {
             self.current_index = next_idx;
@@ -2158,7 +2174,7 @@ impl PhotoViewApp {
 
         *self.anim_pending.lock().unwrap() = None;
 
-        let maybe_pre = self.loaded_prev.lock().unwrap().take();
+        let maybe_pre = Self::take_slot_if_match(&self.loaded_prev, &path, |p| &p.path);
 
         if let Some(pre) = maybe_pre {
             self.current_index = prev_idx;
@@ -2251,7 +2267,6 @@ impl PhotoViewApp {
     }
 
     /// 逐帧步进（dir: -1=上一帧, 1=下一帧）
-
     fn step_anim_frame(&mut self, dir: i32, ctx: &egui::Context) {
         if self.anim_frames.is_empty() {
             return;
@@ -2566,7 +2581,6 @@ impl PhotoViewApp {
     }
 
     /// 绘制设置面板
-
     fn paint_settings(&mut self, ctx: &egui::Context) {
         let screen = ctx.screen_rect();
 
