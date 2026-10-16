@@ -291,3 +291,58 @@ pub(crate) fn exe_dir() -> PathBuf {
 pub(crate) fn settings_path() -> PathBuf {
     exe_dir().join("settings.json")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_round_trip() {
+        for key in [
+            egui::Key::ArrowLeft,
+            egui::Key::ArrowRight,
+            egui::Key::ArrowUp,
+            egui::Key::ArrowDown,
+            egui::Key::C,
+            egui::Key::R,
+            egui::Key::Escape,
+            egui::Key::F1,
+            egui::Key::F5,
+            egui::Key::F12,
+        ] {
+            let s = key_to_string(key);
+            assert_eq!(string_to_key(&s), Some(key), "往返失败: {s}");
+        }
+        assert_eq!(string_to_key("NoSuchKey"), None);
+    }
+
+    #[test]
+    fn bindings_labels_match_get_mut() {
+        let mut kb = KeyBindings::default();
+
+        for (label, _) in kb.labels() {
+            assert!(kb.get_mut(label).is_some(), "标签 {label} 无法映射回字段");
+        }
+
+        *kb.get_mut("下一页").unwrap() = "N".into();
+
+        assert_eq!(kb.next, "N");
+    }
+
+    #[test]
+    fn human_size_units() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(1023), "1023 B");
+        assert_eq!(human_size(2048), "2.0 KB");
+        assert_eq!(human_size(5 * 1024 * 1024), "5.0 MB");
+    }
+
+    #[test]
+    fn mini_size_scales_linearly_with_dpi_factor() {
+        let base = mini_size_pp(1.0);
+
+        assert!((base - 75.6).abs() < 1.0, "2cm@96dpi 约 76px，实际 {base}");
+        assert!((mini_size_pp(1.5) - base * 1.5).abs() < 2.0);
+    }
+}
+

@@ -465,3 +465,33 @@ pub fn mesh_upload_key(mesh: &Mesh) -> usize {
     }
     h
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tri_mesh(count: usize, x: f32) -> Mesh {
+        Mesh {
+            positions: vec![[x, 0.5, -0.5]; count],
+            normals: vec![[0.0, 1.0, 0.0]; count],
+            colors: None,
+            indices: (0..count as u32).collect(),
+        }
+    }
+
+    #[test]
+    fn upload_key_is_stable() {
+        let m = tri_mesh(6, 0.0);
+
+        assert_eq!(mesh_upload_key(&m), mesh_upload_key(&m));
+    }
+
+    #[test]
+    fn upload_key_distinguishes_meshes() {
+        let a = tri_mesh(3, 0.0);
+
+        assert_ne!(mesh_upload_key(&a), mesh_upload_key(&tri_mesh(4, 0.0)));
+        assert_ne!(mesh_upload_key(&a), mesh_upload_key(&tri_mesh(3, 1.0)));
+    }
+}
+

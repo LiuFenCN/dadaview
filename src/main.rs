@@ -3369,3 +3369,89 @@ fn main() -> eframe::Result<()> {
         }),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pre(path: &str) -> PreloadedImage {
+        PreloadedImage {
+            path: PathBuf::from(path),
+            tex_w: 1,
+            tex_h: 1,
+            pixels: Vec::new(),
+            orig_w: 1,
+            orig_h: 1,
+        }
+    }
+
+    fn slot(p: Option<PreloadedImage>) -> Arc<Mutex<Option<PreloadedImage>>> {
+        Arc::new(Mutex::new(p))
+    }
+
+    #[test]
+    fn take_slot_only_when_path_matches() {
+        let s = slot(Some(pre("a.png")));
+        let miss = PhotoViewApp::take_slot_if_match(&s, std::path::Path::new("b.png"), |p| &p.path);
+        assert!(miss.is_none(), "不匹配必须返回 None");
+        assert!(s.lock().unwrap().is_some(), "不匹配时槽位原样保留");
+
+        let hit = PhotoViewApp::take_slot_if_match(&s, std::path::Path::new("a.png"), |p| &p.path);
+        assert!(hit.is_some(), "匹配必须取出");
+        assert!(s.lock().unwrap().is_none(), "取出后槽位清空");
+    }
+
+    #[test]
+    fn refill_dir_promotes_far_candidate_to_near() {
+        // 近槽是过期数据 x，远槽是 a；新目标近=a、远=None
+        // 期望：a 从远槽升级到近槽，x 被丢弃，全程不触发异步加载
+        let near = slot(Some(pre("x.png")));
+        let far = slot(Some(pre("a.png")));
+
+        PhotoViewApp::refill_dir(&near, &far, Some(PathBuf::from("a.png")), None);
+
+        assert_eq!(near.lock().unwrap().as_ref().map(|p| p.path.as_path()),
+            Some(std::path::Path::new("a.png")), "远槽命中新近目标应升级");
+        assert!(far.lock().unwrap().is_none(), "远目标为空则远槽清空且不加载");
+    }
+
+    #[test]
+    fn refill_dir_reuses_both_slots_without_reloading() {
+        let near = slot(Some(pre("a.png")));
+        let far = slot(Some(pre("b.png")));
+        PhotoViewApp::refill_dir(
+            &near,
+            &far,
+            Some(PathBuf::from("a.png")),
+            Some(PathBuf::from("b.png")),
+        );
+        assert_eq!(
+            near.lock().unwrap().as_ref().map(|p| p.path.as_path()),
+            Some(std::path::Path::new("a.png"))
+        );
+        assert_eq!(
+            far.lock().unwrap().as_ref().map(|p| p.path.as_path()),
+            Some(std::path::Path::new("b.png"))
+        );
+    }
+
+    #[test]
+    fn refill_dir_skips_duplicate_far_target() {
+        // 远近目标相同（小目录首尾重叠）：只应命中一个，另一个槽留空且不重复加载
+        let near = slot(None);
+        let far = slot(Some(pre("only.png")));
+        PhotoViewApp::refill_dir(
+            &near,
+            &far,
+            Some(PathBuf::from("only.png")),
+            Some(PathBuf::from("only.png")),
+        );
+        assert_eq!(
+            near.lock().unwrap().as_ref().map(|p| p.path.as_path()),
+            Some(std::path::Path::new("only.png")),
+            "唯一候选应进近槽"
+        );
+        assert!(far.lock().unwrap().is_none(), "重复远目标不应二次加载");
+    }
+}
+
