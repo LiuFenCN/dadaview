@@ -409,18 +409,107 @@ fn load_obj(path: &Path) -> anyhow::Result<Mesh> {
 }
 
 fn load_stl(path: &Path) -> anyhow::Result<Mesh> {
-    let mut file = std::fs::File::open(path)?;
-    let mesh = stl_io::read_stl(&mut file)?;
-    let positions: Vec<[f32; 3]> = mesh.vertices.iter().map(|v| [v[0], v[1], v[2]]).collect();
-    let mut indices = Vec::with_capacity(mesh.faces.len() * 3);
-    for f in &mesh.faces {
-        indices.extend_from_slice(&[
-            f.vertices[0] as u32,
-            f.vertices[1] as u32,
-            f.vertices[2] as u32,
-        ]);
+    let data = std::fs::read(path)?;
+    let (positions, indices) = if is_ascii_stl(&data) {
+        parse_ascii_stl(&data)?
+    } else {
+        parse_binary_stl(&data)?
+    };
+    if positions.is_empty() {
+        anyhow::bail!("STL 中没有有效三角形");
     }
     Ok(Mesh::from_positions_indices(positions, indices, None))
+}
+
+/// 二进制 STL 长度恰好为 84 + 50×三角形数；否则按 "solid" 前缀判 ASCII
+fn is_ascii_stl(data: &[u8]) -> bool {
+    if data.len() >= 84 {
+        let count = u32::from_le_bytes([data[80], data[81], data[82], data[83]]) as usize;
+
+        if let Some(total) = count.checked_mul(50).and_then(|x| x.checked_add(84))
+            && total == data.len()
+        {
+            return false;
+        }
+    }
+
+    let head: String = data.iter().take(256).map(|&b| b as char).collect();
+
+    head.trim_start().to_ascii_lowercase().starts_with("solid")
+}
+
+fn read_f32_at(data: &[u8], off: usize) -> f32 {
+    f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+}
+
+fn parse_binary_stl(data: &[u8]) -> anyhow::Result<(Vec<[f32; 3]>, Vec<u32>)> {
+    if data.len() < 84 {
+        anyhow::bail!("STL 文件过小");
+    }
+
+    let count = u32::from_le_bytes([data[80], data[81], data[82], data[83]]) as usize;
+
+    let need = 84usize
+        .checked_add(count.checked_mul(50).ok_or_else(|| anyhow::anyhow!("STL 三角形数过大"))?)
+        .ok_or_else(|| anyhow::anyhow!("STL 长度溢出"))?;
+
+    if data.len() < need {
+        anyhow::bail!("STL 二进制数据不完整");
+    }
+
+    let mut positions = Vec::with_capacity(count * 3);
+
+    let mut indices = Vec::with_capacity(count * 3);
+
+    let mut off = 84 + 12; // 跳过法线
+
+    for _ in 0..count {
+        for _ in 0..3 {
+            positions.push([
+                read_f32_at(data, off),
+                read_f32_at(data, off + 4),
+                read_f32_at(data, off + 8),
+            ]);
+
+            indices.push((positions.len() - 1) as u32);
+
+            off += 12;
+        }
+
+        off += 12 + 2; // 跳过下一条法线 + 属性字节
+    }
+
+    Ok((positions, indices))
+}
+
+fn parse_ascii_stl(data: &[u8]) -> anyhow::Result<(Vec<[f32; 3]>, Vec<u32>)> {
+    let text = std::str::from_utf8(data).map_err(|_| anyhow::anyhow!("STL 编码错误"))?;
+
+    let mut positions = Vec::new();
+
+    let mut indices = Vec::new();
+
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+
+        if it.next() != Some("vertex") {
+            continue;
+        }
+
+        let mut p = [0.0f32; 3];
+
+        for slot in p.iter_mut() {
+            let v = it.next().ok_or_else(|| anyhow::anyhow!("STL vertex 行不完整"))?;
+
+            *slot = v.parse().map_err(|_| anyhow::anyhow!("STL 数字解析失败"))?;
+        }
+
+        positions.push(p);
+
+        indices.push((positions.len() - 1) as u32);
+    }
+
+    Ok((positions, indices))
 }
 
 fn load_gltf(path: &Path) -> anyhow::Result<Mesh> {
@@ -2468,6 +2557,37 @@ mod tests {
     #[test]
     fn load_stl_cube() {
         assert!(Model3D::load_path(&sample_path("cube.stl")).is_ok());
+    }
+
+    #[test]
+    fn stl_binary_and_ascii_parse() {
+        let mut bytes = vec![0u8; 84];
+
+        bytes[80..84].copy_from_slice(&1u32.to_le_bytes());
+
+        bytes.extend_from_slice(&[0u8; 12]); // 法线
+
+        for v in [0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // 属性字节
+
+        let (pos, idx) = parse_binary_stl(&bytes).expect("binary stl");
+
+        assert_eq!(pos.len(), 3);
+
+        assert_eq!(idx, vec![0, 1, 2]);
+
+        assert!(!is_ascii_stl(&bytes));
+
+        let ascii = b"solid s\nfacet normal 0 0 1\nouter loop\nvertex 1 2 3\nvertex 4 5 6\nvertex 7 8 9\nendloop\nendfacet\nendsolid s";
+
+        assert!(is_ascii_stl(ascii));
+
+        let (pos, _) = parse_ascii_stl(ascii).expect("ascii stl");
+
+        assert_eq!(pos[0], [1.0, 2.0, 3.0]);
     }
 
     #[test]
