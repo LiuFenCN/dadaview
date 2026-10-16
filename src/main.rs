@@ -285,15 +285,22 @@ fn string_to_key(s: &str) -> Option<egui::Key> {
         "Z" => Some(egui::Key::Z),
 
         s if s.starts_with('F') => {
-            if let Ok(n) = s[1..].parse::<u8>()
-                && (1..=12).contains(&n)
-            {
-                return Some(unsafe {
-                    std::mem::transmute::<u8, egui::Key>((egui::Key::F1 as u8) + n - 1)
-                });
+            // 显式枚举：egui::Key 判别式不连续，不能用数值推算
+            match s {
+                "F1" => Some(egui::Key::F1),
+                "F2" => Some(egui::Key::F2),
+                "F3" => Some(egui::Key::F3),
+                "F4" => Some(egui::Key::F4),
+                "F5" => Some(egui::Key::F5),
+                "F6" => Some(egui::Key::F6),
+                "F7" => Some(egui::Key::F7),
+                "F8" => Some(egui::Key::F8),
+                "F9" => Some(egui::Key::F9),
+                "F10" => Some(egui::Key::F10),
+                "F11" => Some(egui::Key::F11),
+                "F12" => Some(egui::Key::F12),
+                _ => None,
             }
-
-            None
         }
 
         _ => None,
@@ -448,6 +455,8 @@ struct PhotoViewApp {
     // GIF 动画支持
     anim_frames: Vec<AnimFrame>, // 所有动画帧
 
+    anim_textures: Vec<Option<TextureHandle>>, // 每帧纹理缓存，避免来回重传
+
     anim_current: usize, // 当前帧索引
 
     anim_next_time: f64, // 下一帧切换时间
@@ -555,6 +564,7 @@ impl Default for PhotoViewApp {
             deferred_resize_time: None,
 
             anim_frames: Vec::new(),
+            anim_textures: Vec::new(),
 
             anim_current: 0,
 
@@ -3171,7 +3181,7 @@ impl eframe::App for PhotoViewApp {
                 && !frames.is_empty()
             {
                 self.anim_frames = frames;
-
+                self.anim_textures.clear();
                 self.anim_current = 0;
             }
         }
@@ -3180,36 +3190,45 @@ impl eframe::App for PhotoViewApp {
 
         if self.is_animated && self.anim_frames.len() > 1 && !self.anim_paused {
             let now = ctx.input(|i| i.time);
-
-            if now >= self.anim_next_time {
-                self.anim_current = (self.anim_current + 1) % self.anim_frames.len();
-
-                let frame = &self.anim_frames[self.anim_current];
-
-                let color_image = egui::ColorImage {
-                    size: [frame.tex_w, frame.tex_h],
-                    pixels: frame.pixels.clone(),
-                };
-
-                let texture =
-                    ctx.load_texture("image", color_image, egui::TextureOptions::default());
-
-                self.current_texture = Some(texture);
-
-                self.current_pixels = frame.pixels.clone();
-
-                self.current_tex_size = [frame.tex_w, frame.tex_h];
-
-                self.anim_next_time = now + frame.delay_ms as f64 / 1000.0;
+            let need_upload = self
+                .anim_textures
+                .get(self.anim_current)
+                .map_or(true, |t| t.is_none());
+            if now >= self.anim_next_time || need_upload {
+                if now >= self.anim_next_time {
+                    self.anim_current = (self.anim_current + 1) % self.anim_frames.len();
+                    let frame = &self.anim_frames[self.anim_current];
+                    self.anim_next_time = now + frame.delay_ms as f64 / 1000.0;
+                }
+                let fi = self.anim_current;
+                let stale = self
+                    .anim_textures
+                    .get(fi)
+                    .and_then(|o| o.as_ref())
+                    .map_or(true, |tex| {
+                        self.current_texture.as_ref().map_or(true, |cur| cur.id() != tex.id())
+                    });
+                if stale {
+                    let frame = &self.anim_frames[fi];
+                    let tex = ctx.load_texture(
+                        "image",
+                        egui::ColorImage {
+                            size: [frame.tex_w, frame.tex_h],
+                            pixels: frame.pixels.clone(),
+                        },
+                        egui::TextureOptions::default(),
+                    );
+                    self.current_pixels = frame.pixels.clone();
+                    self.current_tex_size = [frame.tex_w, frame.tex_h];
+                    self.current_texture = Some(tex);
+                    if self.anim_textures.len() == self.anim_frames.len() {
+                        self.anim_textures[fi] = self.current_texture.clone();
+                    }
+                }
             }
-
-            ctx.request_repaint(); // 持续请求重绘
-        }
-
-        // GIF 播放时需要持续重绘
-
-        if self.is_animated && !self.anim_paused {
-            ctx.request_repaint();
+            // 只在下一帧到期时唤醒，不再忙刷
+            let delay = ((self.anim_next_time - ctx.input(|i| i.time)) * 1000.0).max(16.0) as u64;
+            ctx.request_repaint_after(std::time::Duration::from_millis(delay));
         }
 
         // 处理命令行传入的图片路径
