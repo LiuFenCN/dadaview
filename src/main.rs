@@ -3410,9 +3410,15 @@ mod tests {
 
         PhotoViewApp::refill_dir(&near, &far, Some(PathBuf::from("a.png")), None);
 
-        assert_eq!(near.lock().unwrap().as_ref().map(|p| p.path.as_path()),
-            Some(std::path::Path::new("a.png")), "远槽命中新近目标应升级");
-        assert!(far.lock().unwrap().is_none(), "远目标为空则远槽清空且不加载");
+        assert_eq!(
+            near.lock().unwrap().as_ref().map(|p| p.path.as_path()),
+            Some(std::path::Path::new("a.png")),
+            "远槽命中新近目标应升级"
+        );
+        assert!(
+            far.lock().unwrap().is_none(),
+            "远目标为空则远槽清空且不加载"
+        );
     }
 
     #[test]
@@ -3454,4 +3460,3 @@ mod tests {
         assert!(far.lock().unwrap().is_none(), "重复远目标不应二次加载");
     }
 }
-

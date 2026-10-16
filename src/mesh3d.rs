@@ -450,7 +450,11 @@ fn parse_binary_stl(data: &[u8]) -> anyhow::Result<(Vec<[f32; 3]>, Vec<u32>)> {
     let count = u32::from_le_bytes([data[80], data[81], data[82], data[83]]) as usize;
 
     let need = 84usize
-        .checked_add(count.checked_mul(50).ok_or_else(|| anyhow::anyhow!("STL 三角形数过大"))?)
+        .checked_add(
+            count
+                .checked_mul(50)
+                .ok_or_else(|| anyhow::anyhow!("STL 三角形数过大"))?,
+        )
         .ok_or_else(|| anyhow::anyhow!("STL 长度溢出"))?;
 
     if data.len() < need {
@@ -499,7 +503,9 @@ fn parse_ascii_stl(data: &[u8]) -> anyhow::Result<(Vec<[f32; 3]>, Vec<u32>)> {
         let mut p = [0.0f32; 3];
 
         for slot in p.iter_mut() {
-            let v = it.next().ok_or_else(|| anyhow::anyhow!("STL vertex 行不完整"))?;
+            let v = it
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("STL vertex 行不完整"))?;
 
             *slot = v.parse().map_err(|_| anyhow::anyhow!("STL 数字解析失败"))?;
         }

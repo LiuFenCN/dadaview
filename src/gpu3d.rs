@@ -450,17 +450,37 @@ fn aligned_bytes_per_row(width: u32) -> u32 {
     unpadded.div_ceil(align) * align
 }
 
-/// 供调用方做 mesh 指纹，避免无意义重传
+/// 供调用方做 mesh 指纹，避免无意义重传。取首/中/末顶点与首/末索引+各数组长度，
+/// 降低同文件换模型（顶点数不变）时的碰撞概率
 pub fn mesh_upload_key(mesh: &Mesh) -> usize {
     let mut h: usize = 0x9e37_79b9;
     h ^= mesh.positions.len().wrapping_mul(0x85eb_ca6b);
     h ^= mesh.indices.len().wrapping_mul(0xc2b2_ae35);
-    if let Some(p) = mesh.positions.first() {
+    h ^= mesh.normals.len().wrapping_mul(0x5f35_6495);
+    h ^= mesh
+        .colors
+        .as_ref()
+        .map_or(0, |c| c.len())
+        .wrapping_mul(0x2722_0a95);
+    let mid = mesh.positions.len() / 2;
+    for p in [
+        mesh.positions.first(),
+        mesh.positions.get(mid),
+        mesh.positions.last(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        h = h.rotate_left(13);
         h ^= (p[0].to_bits() as usize).wrapping_mul(31);
         h ^= (p[1].to_bits() as usize).wrapping_mul(37);
         h ^= (p[2].to_bits() as usize).wrapping_mul(41);
     }
-    if let Some(i) = mesh.indices.first() {
+    for i in [mesh.indices.first(), mesh.indices.last()]
+        .into_iter()
+        .flatten()
+    {
+        h = h.rotate_left(7);
         h ^= (*i as usize).wrapping_mul(43);
     }
     h
@@ -493,5 +513,16 @@ mod tests {
         assert_ne!(mesh_upload_key(&a), mesh_upload_key(&tri_mesh(4, 0.0)));
         assert_ne!(mesh_upload_key(&a), mesh_upload_key(&tri_mesh(3, 1.0)));
     }
-}
 
+    #[test]
+    fn upload_key_distinguishes_tail_edits() {
+        // 同顶点数、只改末尾顶点：旧指纹（只看首元素）会碰撞导致 GPU 用旧几何
+        let a = tri_mesh(6, 0.0);
+
+        let mut b = a.clone();
+
+        b.positions.last_mut().unwrap()[0] = 9.0;
+
+        assert_ne!(mesh_upload_key(&a), mesh_upload_key(&b));
+    }
+}

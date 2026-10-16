@@ -345,4 +345,3 @@ mod tests {
         assert!((mini_size_pp(1.5) - base * 1.5).abs() < 2.0);
     }
 }
-
