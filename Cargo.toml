@@ -16,6 +16,7 @@ tobj = "4.0"
 gltf = "1.4"
 glam = "0.29"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 wgpu = "0.20"
 pollster = "0.3"
 bytemuck = { version = "1.14", features = ["derive"] }

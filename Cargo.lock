@@ -2670,6 +2670,7 @@ dependencies = [
  "bytemuck",
  "chrono",
  "eframe",
+ "flate2",
  "glam",
  "gltf",
  "image",

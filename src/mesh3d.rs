@@ -1901,103 +1901,433 @@ fn collect_fbx_poly(s: &str, out: &mut Vec<u32>) {
     }
 }
 
-fn load_fbx_binary(data: &[u8]) -> anyhow::Result<Mesh> {
-    let find_bytes = |hay: &[u8], needle: &[u8]| -> Option<usize> {
-        hay.windows(needle.len()).position(|w| w == needle)
-    };
-    let mut positions = Vec::new();
-    let mut indices = Vec::new();
-    if let Some(pos) = find_bytes(data, b"Vertices")
-        && let Some(arr) = extract_fbx_bin_array_f64(data, pos)
-    {
-        positions = arr;
+// ─── FBX 二进制节点树解析 ───
+// 参考 Autodesk FBX SDK 文档 BinaryFileFormat.pdf：
+// 节点 = 结束偏移 + 属性计数 + 属性列表长度 + 名字 + 属性 + 子节点，
+// 子节点块以一条结束偏移为 0 的空记录收尾。
+// 实测导出器有两套写法：Blender 把 Vertices / PolygonVertexIndex 直接作为
+// Geometry 的子节点（数组大且 zlib 压缩），老式 SDK 把它们放在 Properties70
+// 的 P 记录里。负数收尾的 PolygonVertexIndex 表示一个多边形结束。
+
+enum FbxProp {
+    Str(String),
+    F64s(Vec<f64>),
+    I32s(Vec<i32>),
+    I64s(Vec<i64>),
+    Other,
+}
+
+struct FbxCur<'a> {
+    d: &'a [u8],
+    p: usize,
+    ver: u32,
+}
+
+impl<'a> FbxCur<'a> {
+    fn u8(&mut self) -> Option<u8> {
+        let v = *self.d.get(self.p)?;
+        self.p += 1;
+        Some(v)
     }
-    if let Some(pos) = find_bytes(data, b"PolygonVertexIndex")
-        && let Some(arr) = extract_fbx_bin_array_i32(data, pos)
-    {
-        let mut poly = Vec::new();
-        for v in arr {
-            if v < 0 {
-                poly.push((-v - 1) as u32);
-                fan_triangles(&mut indices, &poly);
-                poly.clear();
-            } else {
-                poly.push(v as u32);
+
+    fn u16(&mut self) -> Option<u16> {
+        let b: [u8; 2] = self.d.get(self.p..self.p + 2)?.try_into().ok()?;
+        self.p += 2;
+        Some(u16::from_le_bytes(b))
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        let b: [u8; 4] = self.d.get(self.p..self.p + 4)?.try_into().ok()?;
+        self.p += 4;
+        Some(u32::from_le_bytes(b))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        let b: [u8; 8] = self.d.get(self.p..self.p + 8)?.try_into().ok()?;
+        self.p += 8;
+        Some(u64::from_le_bytes(b))
+    }
+
+    fn bytes(&mut self, n: usize) -> Option<&'a [u8]> {
+        let s = self.d.get(self.p..self.p + n)?;
+        self.p += n;
+        Some(s)
+    }
+
+    /// 版本 ≥7500 用 64 位结束偏移，否则 32 位
+    fn off(&mut self) -> Option<usize> {
+        if self.ver >= 7500 {
+            Some(self.u64()? as usize)
+        } else {
+            Some(self.u32()? as usize)
+        }
+    }
+
+    fn off_size(&self) -> usize {
+        if self.ver >= 7500 { 8 } else { 4 }
+    }
+
+    fn read_property(&mut self) -> Option<FbxProp> {
+        let t = self.u8()?;
+        match t {
+            b'C' => {
+                self.u8()?;
+                Some(FbxProp::Other)
+            }
+            b'Y' => {
+                self.u16()?;
+                Some(FbxProp::Other)
+            }
+            b'B' | b'I' | b'F' | b'D' | b'L' => {
+                let n = match t {
+                    b'B' => 1,
+                    b'I' | b'F' => 4,
+                    b'D' | b'L' => 8,
+                    _ => 0,
+                };
+                self.bytes(n)?;
+                Some(FbxProp::Other)
+            }
+            b'S' | b'R' => {
+                let n = self.u32()? as usize;
+                let s = self.bytes(n)?;
+                Some(FbxProp::Str(String::from_utf8_lossy(s).into_owned()))
+            }
+            b'f' | b'd' | b'i' | b'l' | b'y' | b'c' | b'b' => self.read_array(t),
+            _ => None,
+        }
+    }
+
+    /// 数组属性：头是 元素个数 + 编码 + 存储字节数，负载按存储长度前进。
+    /// 实测 Blender/Kaydara 导出即为此顺序（encoding=1 时第三个字段是压缩后长度）
+    fn read_array(&mut self, t: u8) -> Option<FbxProp> {
+        let count = self.u32()? as usize;
+        let encoding = self.u32()?;
+        let stored_size = self.u32()? as usize;
+        let esz = match t {
+            b'f' | b'i' => 4usize,
+            b'd' | b'l' => 8,
+            b'y' => 2,
+            b'c' | b'b' => 1,
+            _ => return None,
+        };
+        let raw_len = count.checked_mul(esz)?;
+        if raw_len > 2_000_000_000 {
+            return None;
+        }
+        // 未压缩时 ArrayDataSize 常为 0，按元素数推算；压缩时它就是压缩后长度
+        let stored = if encoding == 0 { raw_len } else { stored_size };
+        let slice = self.bytes(stored)?;
+        let decoded: std::borrow::Cow<'a, [u8]> = match encoding {
+            0 => slice.into(),
+            1 => {
+                let mut stream = flate2::read::ZlibDecoder::new(slice);
+                let mut buf = Vec::with_capacity(raw_len.min(64 * 1024 * 1024));
+                std::io::Read::read_to_end(&mut stream, &mut buf).ok()?;
+                buf.into()
+            }
+            _ => return None, // LZMA：极少见，放弃
+        };
+        let src = decoded.as_ref();
+        if src.len() < raw_len {
+            return None;
+        }
+        match t {
+            b'f' => Some(FbxProp::F64s(
+                src.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b) as f64)
+                    .collect(),
+            )),
+            b'd' => Some(FbxProp::F64s(
+                src.as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|b| f64::from_le_bytes(*b))
+                    .collect(),
+            )),
+            b'i' => Some(FbxProp::I32s(
+                src.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| i32::from_le_bytes(*b))
+                    .collect(),
+            )),
+            b'l' => Some(FbxProp::I64s(
+                src.as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|b| i64::from_le_bytes(*b))
+                    .collect(),
+            )),
+            _ => Some(FbxProp::Other),
+        }
+    }
+}
+
+/// 解析一个节点：返回（名字、属性、子节点起始位置）
+fn fbx_read_node(c: &mut FbxCur, end: usize) -> Option<(String, Vec<FbxProp>, usize)> {
+    let node_end = c.off()?;
+    let _num_props = c.u32()?;
+    let prop_list_len = c.u32()? as usize;
+    let name_len = c.u8()? as usize;
+    if node_end <= c.p || node_end > end {
+        return None;
+    }
+    let name = String::from_utf8_lossy(c.bytes(name_len)?).into_owned();
+    let mut props = Vec::new();
+    if prop_list_len > 0 {
+        // 编码块（版本 ≥7500）：整个属性列表 zlib 压缩，先解压再解析
+        let stop = (c.p + prop_list_len).min(end);
+        let raw: &[u8] = &c.d[c.p.min(c.d.len())..stop];
+        let mut decompressed: Option<Vec<u8>> = None;
+        if c.ver >= 7500 && raw.first() == Some(&1) && raw.get(1) == Some(&0x78) {
+            let mut stream = flate2::read::ZlibDecoder::new(&raw[1..]);
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut stream, &mut buf).ok()?;
+            decompressed = Some(buf);
+        }
+        c.p = stop;
+        let list: &[u8] = decompressed.as_deref().unwrap_or(raw);
+        let mut inner = FbxCur {
+            d: list,
+            p: 0,
+            ver: c.ver,
+        };
+        // 属性列表以 0x00 结束；解析失败即停，剩余字节交给子节点层
+        while inner.d.get(inner.p) != Some(&0) {
+            match inner.read_property() {
+                Some(p) => props.push(p),
+                None => break,
             }
         }
     }
-    if positions.len() < 9 || indices.is_empty() {
-        anyhow::bail!("二进制 FBX 暂无法可靠解析，请导出为 OBJ/GLB/STL");
+    Some((name, props, c.p))
+}
+
+impl FbxProp {
+    fn f64s(&self) -> Option<&[f64]> {
+        match self {
+            FbxProp::F64s(v) => Some(v),
+            _ => None,
+        }
     }
-    let verts: Vec<[f32; 3]> = positions
-        .as_chunks::<3>()
-        .0
-        .iter()
-        .map(|c| [c[0], c[1], c[2]])
-        .collect();
+
+    fn i32s(&self) -> Option<Vec<i32>> {
+        match self {
+            FbxProp::I32s(v) => Some(v.clone()),
+            FbxProp::I64s(v) => Some(v.iter().map(|&x| x as i32).collect()),
+            _ => None,
+        }
+    }
+}
+
+/// 一个 Geometry 子树里累积的网格数据：顶点与索引往往分散在不同节点，
+/// 要收集齐了才结算成一块网格
+#[derive(Default)]
+struct FbxGeom {
+    verts: Option<Vec<[f32; 3]>>,
+    tris: Option<Vec<u32>>,
+}
+
+fn fbx_verts_from(props: &[FbxProp]) -> Option<Vec<[f32; 3]>> {
+    let v = props.iter().find_map(FbxProp::f64s)?;
+    if v.len() >= 9 && v.len() % 3 == 0 {
+        Some(
+            v.as_chunks::<3>()
+                .0
+                .iter()
+                .map(|c| [c[0] as f32, c[1] as f32, c[2] as f32])
+                .collect(),
+        )
+    } else {
+        None
+    }
+}
+
+fn fbx_tris_from(props: &[FbxProp]) -> Option<Vec<u32>> {
+    let ix = props.iter().find_map(FbxProp::i32s)?;
+    if ix.len() < 3 {
+        return None;
+    }
+    let mut t = Vec::new();
+    fbx_fan_poly(&ix, &mut t);
+    Some(t)
+}
+
+/// 网格数据有两种写法，都要支持：
+/// 1) Geometry 的直接子节点名为 Vertices / PolygonVertexIndex，属性就是数组本身；
+/// 2) Properties70 里的 P 记录，形如 [名字, "KDoubleArray", 元素类型, 默认值, …, 数组]，
+///    数组不一定紧跟名字，命中后要在其后向前找第一个同类数组。
+fn fbx_props_take(node: &str, props: &[FbxProp], cur: &mut FbxGeom) {
+    match node {
+        "Vertices" | "ControlPoints" if cur.verts.is_none() => cur.verts = fbx_verts_from(props),
+        "PolygonVertexIndex" | "Indexes" if cur.tris.is_none() => cur.tris = fbx_tris_from(props),
+        _ => {}
+    }
+    for (i, p) in props.iter().enumerate() {
+        let FbxProp::Str(name) = p else { continue };
+        let rest = &props[i + 1..];
+        match name.as_str() {
+            "Vertices" | "ControlPoints" if cur.verts.is_none() => cur.verts = fbx_verts_from(rest),
+            "PolygonVertexIndex" | "Indexes" if cur.tris.is_none() => {
+                cur.tris = fbx_tris_from(rest)
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 顶点与索引都齐了才并入总网格
+fn fbx_flush(cur: &mut FbxGeom, out: &mut (Vec<[f32; 3]>, Vec<u32>)) {
+    let (Some(verts), Some(tris)) = (cur.verts.take(), cur.tris.take()) else {
+        return;
+    };
     let n = verts.len() as u32;
-    indices.retain(|i| *i < n);
-    Ok(Mesh::from_positions_indices(verts, indices, None))
+    let tris: Vec<u32> = tris.into_iter().take_while(|&i| i < n).collect();
+    if tris.len() < 3 {
+        return;
+    }
+    let base = out.0.len() as u32;
+    out.0.extend(verts);
+    out.1.extend(tris.into_iter().map(|i| i + base));
 }
 
-fn extract_fbx_bin_array_f64(data: &[u8], name_at: usize) -> Option<Vec<f32>> {
-    let start = name_at + 8;
-    for off in 0..80usize {
-        let p = start + off;
-        if p + 12 > data.len() {
-            break;
+/// 把 PolygonVertexIndex（负数收尾）展开成三角形
+fn fbx_fan_poly(src: &[i32], out: &mut Vec<u32>) {
+    let mut poly = Vec::new();
+    for &v in src {
+        if v < 0 {
+            poly.push((-v - 1) as u32);
+            fan_triangles(out, &poly);
+            poly.clear();
+        } else {
+            poly.push(v as u32);
         }
-        let len = u32::from_le_bytes(data[p..p + 4].try_into().ok()?) as usize;
-        if !(9..=50_000_000).contains(&len) {
-            continue;
-        }
-        let enc = u32::from_le_bytes(data[p + 4..p + 8].try_into().ok()?);
-        let comp = u32::from_le_bytes(data[p + 8..p + 12].try_into().ok()?);
-        if enc != 0 || comp != 0 {
-            continue;
-        }
-        let byte = len * 8;
-        if p + 12 + byte > data.len() {
-            continue;
-        }
-        let mut out = Vec::with_capacity(len);
-        for i in 0..len {
-            let b = &data[p + 12 + i * 8..p + 12 + i * 8 + 8];
-            out.push(f64::from_le_bytes(b.try_into().ok()?) as f32);
-        }
-        return Some(out);
     }
-    None
 }
 
-fn extract_fbx_bin_array_i32(data: &[u8], name_at: usize) -> Option<Vec<i32>> {
-    let start = name_at + 18;
-    for off in 0..80usize {
-        let p = start + off;
-        if p + 12 > data.len() {
-            break;
-        }
-        let len = u32::from_le_bytes(data[p..p + 4].try_into().ok()?) as usize;
-        if !(3..=80_000_000).contains(&len) {
-            continue;
-        }
-        let enc = u32::from_le_bytes(data[p + 4..p + 8].try_into().ok()?);
-        let comp = u32::from_le_bytes(data[p + 8..p + 12].try_into().ok()?);
-        if enc != 0 || comp != 0 {
-            continue;
-        }
-        let byte = len * 4;
-        if p + 12 + byte > data.len() {
-            continue;
-        }
-        let mut out = Vec::with_capacity(len);
-        for i in 0..len {
-            let b = &data[p + 12 + i * 4..p + 12 + i * 4 + 4];
-            out.push(i32::from_le_bytes(b.try_into().ok()?));
-        }
-        return Some(out);
+/// 校验 p 处是否像一个节点记录：结束偏移在文件内、属性计数与列表长度自洽、
+/// 名字是可打印 ASCII（根节点名字为空）
+fn fbx_looks_like_node(c: &FbxCur, p: usize) -> bool {
+    let mut t = FbxCur {
+        d: c.d,
+        p,
+        ver: c.ver,
+    };
+    let sz = t.off_size();
+    let (Some(e), Some(np), Some(pl), Some(nl)) = (t.off(), t.u32(), t.u32(), t.u8()) else {
+        return false;
+    };
+    let body = p + sz + 9;
+    let nl = nl as usize;
+    // 记录内容 = 名字 + 属性列表 + 至少一条子节点结束空记录
+    if e < body + nl + pl as usize + sz + 9 || e > c.d.len() || np > 1000 {
+        return false;
     }
-    None
+    // 无名记录只能是根节点：根节点不带属性
+    if nl == 0 && (np != 0 || pl != 0) {
+        return false;
+    }
+    let name = &c.d[body..body + nl];
+    name.iter().all(|b| b.is_ascii_graphic() || *b == b' ')
+}
+
+fn load_fbx_binary(data: &[u8]) -> anyhow::Result<Mesh> {
+    if data.len() < 32 {
+        anyhow::bail!("FBX 文件过小");
+    }
+    let ver = u32::from_le_bytes(data[23..27].try_into().unwrap());
+    let probe = FbxCur {
+        d: data,
+        p: 27,
+        ver,
+    };
+    // 23 字节魔数 + 4 字节版本之后，不同导出器写法不一：有的直接跟第一个节点，
+    // 有的先写保留字段和文档结束偏移再跟无名根节点。逐格试探定位第一条记录。
+    let Some(start) = (0..8)
+        .map(|i| 27 + i * 4)
+        .find(|p| *p + probe.off_size() + 9 < data.len() && fbx_looks_like_node(&probe, *p))
+    else {
+        anyhow::bail!("二进制 FBX 头无法识别");
+    };
+    let mut c = FbxCur {
+        d: data,
+        p: start,
+        ver,
+    };
+
+    let mut out = (Vec::<[f32; 3]>::new(), Vec::<u32>::new());
+    let mut cur = FbxGeom::default();
+
+    fn scan(
+        c: &mut FbxCur,
+        end: usize,
+        depth: u32,
+        inside_geometry: bool,
+        cur: &mut FbxGeom,
+        out: &mut (Vec<[f32; 3]>, Vec<u32>),
+    ) {
+        if depth > 16 {
+            return;
+        }
+        while c.p + c.off_size() <= end {
+            // 空记录 = 结束偏移为 0，它总在子节点块末尾；不能只看首字节，
+            // ≥7500 的 8 字节偏移低 4 字节恒为 0
+            let sz = c.off_size();
+            let Some(node_end) = c.off() else { return };
+            c.p -= sz; // 回退，让 fbx_read_node 从记录起点重新解析
+            if node_end == 0 {
+                return;
+            }
+            if node_end <= c.p || node_end > end {
+                // 头不合法：前进一格避免死循环，让外层尽早放弃
+                c.p += sz;
+                continue;
+            }
+            match fbx_read_node(c, node_end) {
+                Some((name, props, children_at)) => {
+                    let is_geom_node = name == "Geometry";
+                    if is_geom_node {
+                        // 嵌套 Geometry（少见）：先把上一层的数据结算掉
+                        fbx_flush(cur, out);
+                        *cur = FbxGeom::default();
+                    }
+                    if is_geom_node || inside_geometry {
+                        fbx_props_take(&name, &props, cur);
+                    }
+                    let mut ch = FbxCur {
+                        d: c.d,
+                        p: children_at,
+                        ver: c.ver,
+                    };
+                    scan(
+                        &mut ch,
+                        node_end,
+                        depth + 1,
+                        is_geom_node || inside_geometry,
+                        cur,
+                        out,
+                    );
+                    if is_geom_node {
+                        fbx_flush(cur, out);
+                    }
+                    c.p = node_end;
+                }
+                // 解析失败：信任结束偏移跳到下一兄弟，避免死循环
+                None => c.p = node_end,
+            }
+        }
+    }
+
+    scan(&mut c, data.len(), 0, false, &mut cur, &mut out);
+    fbx_flush(&mut cur, &mut out);
+
+    if out.0.len() < 3 || out.1.len() < 3 {
+        anyhow::bail!("二进制 FBX 未找到多边形网格（可能只含曲线/点），请导出为 OBJ/GLB/STL");
+    }
+    Ok(Mesh::from_positions_indices(out.0, out.1, None))
 }
 
 fn load_pmx(path: &Path) -> anyhow::Result<Mesh> {
@@ -2553,6 +2883,258 @@ mod tests {
     #[test]
     fn load_off_cube() {
         assert!(Model3D::load_path(&sample_path("cube.off")).is_ok());
+    }
+
+    fn p_str(s: &str) -> Vec<u8> {
+        let mut v = vec![b'S'];
+        v.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        v.extend_from_slice(s.as_bytes());
+        v
+    }
+
+    /// 数组属性头：元素个数 + 编码 + 存储字节数
+    fn p_array(tag: u8, count: usize, enc: u32, stored: u32) -> Vec<u8> {
+        let mut v = vec![tag];
+        v.extend_from_slice(&(count as u32).to_le_bytes());
+        v.extend_from_slice(&enc.to_le_bytes());
+        v.extend_from_slice(&stored.to_le_bytes());
+        v
+    }
+
+    fn p_d_raw(vals: &[f64]) -> Vec<u8> {
+        let mut v = p_array(b'd', vals.len(), 0, 0);
+        for x in vals {
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        v
+    }
+
+    fn p_i_raw(vals: &[i32]) -> Vec<u8> {
+        let mut v = p_array(b'i', vals.len(), 0, 0);
+        for x in vals {
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        v
+    }
+
+    fn zlib(bytes: &[u8]) -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::ZlibEncoder;
+        let mut e = ZlibEncoder::new(Vec::new(), Compression::default());
+        std::io::Write::write_all(&mut e, bytes).unwrap();
+        e.finish().unwrap()
+    }
+
+    /// Blender 导出风格：大数组用 zlib 压缩
+    fn p_d_zipped(vals: &[f64]) -> Vec<u8> {
+        let mut raw = Vec::with_capacity(vals.len() * 8);
+        for x in vals {
+            raw.extend_from_slice(&x.to_le_bytes());
+        }
+        let body = zlib(&raw);
+        let mut v = p_array(b'd', vals.len(), 1, body.len() as u32);
+        v.extend_from_slice(&body);
+        v
+    }
+
+    fn p_i_zipped(vals: &[i32]) -> Vec<u8> {
+        let mut raw = Vec::with_capacity(vals.len() * 4);
+        for x in vals {
+            raw.extend_from_slice(&x.to_le_bytes());
+        }
+        let body = zlib(&raw);
+        let mut v = p_array(b'i', vals.len(), 1, body.len() as u32);
+        v.extend_from_slice(&body);
+        v
+    }
+
+    struct Spec {
+        name: &'static str,
+        props: Vec<Vec<u8>>,
+        children: Vec<Spec>,
+    }
+
+    /// 写一条节点记录：base 是它在整个文件里的起始偏移
+    fn node(s: &Spec, base: usize) -> Vec<u8> {
+        let mut blob = Vec::new();
+        for p in &s.props {
+            blob.extend_from_slice(p);
+        }
+        if !blob.is_empty() {
+            blob.push(0); // 属性列表结束符计入 PropertyListLen
+        }
+        let head = 4 + 4 + 4 + 1 + s.name.len();
+        let mut kids = Vec::new();
+        for c in &s.children {
+            let at = base + head + blob.len() + kids.len();
+            kids.extend_from_slice(&node(c, at));
+        }
+        let node_end = base + head + blob.len() + kids.len() + 13;
+        let mut out = Vec::new();
+        out.extend_from_slice(&(node_end as u32).to_le_bytes());
+        out.extend_from_slice(&(s.props.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+        out.push(s.name.len() as u8);
+        out.extend_from_slice(s.name.as_bytes());
+        out.extend_from_slice(&blob);
+        out.extend_from_slice(&kids);
+        out.extend_from_slice(&[0u8; 13]); // 子节点结束空记录
+        out
+    }
+
+    /// 版本 7400 文档外壳：魔数 + 版本 + 保留 + 文档结束偏移 + 无名根节点
+    fn fbx_doc(top: Vec<Spec>) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"Kaydara FBX Binary  \x00\x1A\x00");
+        buf.extend_from_slice(&7400u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // 保留
+        let doc_end_at = buf.len();
+        buf.extend_from_slice(&0u32.to_le_bytes()); // 文档结束偏移，最后回填
+        let root_base = buf.len();
+        let mut kids = Vec::new();
+        for s in &top {
+            let at = root_base + 13 + kids.len();
+            kids.extend_from_slice(&node(s, at));
+        }
+        buf.extend_from_slice(&((root_base + 13 + kids.len() + 13) as u32).to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // num_properties
+        buf.extend_from_slice(&0u32.to_le_bytes()); // property_list_len
+        buf.push(0); // name_length
+        buf.extend_from_slice(&kids);
+        buf.extend_from_slice(&[0u8; 13]);
+        let doc = buf.len();
+        buf[doc_end_at..doc_end_at + 4].copy_from_slice(&(doc as u32).to_le_bytes());
+        buf
+    }
+
+    fn fbx_objects(geom_children: Vec<Spec>) -> Spec {
+        Spec {
+            name: "Objects",
+            props: vec![],
+            children: vec![Spec {
+                name: "Geometry",
+                props: vec![p_str("Geometry::Mesh"), p_str("Mesh")],
+                children: geom_children,
+            }],
+        }
+    }
+
+    /// 老式（ComfyUI/SDK）：网格数据放在 Properties70 的 P 记录里，未压缩
+    fn build_fbx_p70(verts: &[f64], poly_idx: &[i32]) -> Vec<u8> {
+        let p = |name: &str, arr: Vec<u8>| Spec {
+            name: "P",
+            props: vec![
+                p_str(name),
+                p_str("KDoubleArray"),
+                p_str("VectorArray"),
+                p_str(""),
+                arr,
+            ],
+            children: vec![],
+        };
+        fbx_doc(vec![fbx_objects(vec![Spec {
+            name: "Properties70",
+            props: vec![],
+            children: vec![
+                p("Vertices", p_d_raw(verts)),
+                p("PolygonVertexIndex", p_i_raw(poly_idx)),
+            ],
+        }])])
+    }
+
+    /// Blender：网格数据放在名为 Vertices / PolygonVertexIndex 的子节点里，且 zlib 压缩
+    fn build_fbx_blender(verts: &[f64], poly_idx: &[i32]) -> Vec<u8> {
+        fbx_doc(vec![fbx_objects(vec![
+            Spec {
+                name: "Vertices",
+                props: vec![p_d_zipped(verts)],
+                children: vec![],
+            },
+            Spec {
+                name: "PolygonVertexIndex",
+                props: vec![p_i_zipped(poly_idx)],
+                children: vec![],
+            },
+        ])])
+    }
+
+    /// 8 顶点立方体：6 个四边形面，负数收尾
+    fn cube_data() -> (Vec<f64>, Vec<i32>) {
+        let verts: Vec<f64> = [
+            [-1.0, -1.0, -1.0],
+            [1.0, -1.0, -1.0],
+            [1.0, 1.0, -1.0],
+            [-1.0, 1.0, -1.0],
+            [-1.0, -1.0, 1.0],
+            [1.0, -1.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [-1.0, 1.0, 1.0],
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let faces = [
+            [0u32, 3, 2, 1],
+            [4, 5, 6, 7],
+            [0, 1, 5, 4],
+            [1, 2, 6, 5],
+            [2, 3, 7, 6],
+            [3, 0, 4, 7],
+        ];
+        let mut poly: Vec<i32> = Vec::new();
+        for f in faces {
+            poly.extend_from_slice(&[f[0] as i32, f[1] as i32, f[2] as i32]);
+            poly.push(-(f[3] as i32) - 1);
+        }
+        (verts, poly)
+    }
+
+    fn assert_cube(mesh: &Mesh) {
+        assert_eq!(mesh.vertex_count(), 8);
+        assert_eq!(mesh.triangle_count(), 12);
+    }
+
+    #[test]
+    fn load_fbx_binary_properties70() {
+        let (verts, poly) = cube_data();
+        let mesh = load_fbx_binary(&build_fbx_p70(&verts, &poly)).expect("p70 fbx");
+        assert_cube(&mesh);
+    }
+
+    #[test]
+    fn load_fbx_binary_blender_children_zlib() {
+        let (verts, poly) = cube_data();
+        let mesh = load_fbx_binary(&build_fbx_blender(&verts, &poly)).expect("blender fbx");
+        assert_cube(&mesh);
+    }
+    /// 用真实导出文件验证解析器（文件不入库）：
+    /// `PHOTOVIEW_FBX=模型.fbx cargo test -- --ignored load_real_fbx_sample`
+    #[test]
+    #[ignore = "需要本机一个真实二进制 FBX 文件路径"]
+    fn load_real_fbx_sample() {
+        let path = std::env::var("PHOTOVIEW_FBX").expect("设置 PHOTOVIEW_FBX 指向二进制 fbx");
+        let data = std::fs::read(&path).unwrap();
+        let name = Path::new(&path)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let mesh = load_fbx_binary(&data).unwrap_or_else(|e| panic!("{name} 解析失败: {e}"));
+        println!(
+            "{name}: {} 顶点 / {} 三角形",
+            mesh.vertex_count(),
+            mesh.triangle_count()
+        );
+        assert!(mesh.vertex_count() >= 3, "{name} 顶点数异常");
+        assert!(mesh.triangle_count() >= 1, "{name} 三角形数异常");
+    }
+
+    #[test]
+    fn load_fbx_binary_rejects_garbage() {
+        let mut data = b"Kaydara FBX Binary  \x00\x1A\x00".to_vec();
+        data.extend_from_slice(&7400u32.to_le_bytes());
+        data.resize(64, 0xAB);
+        assert!(load_fbx_binary(&data).is_err());
     }
 
     #[test]
