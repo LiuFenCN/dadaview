@@ -40,54 +40,6 @@ const SUPPORTED_EXTS: &[&str] = &[
     "fbx", "pmx", "pmd", "usd", "usda", "usdc", "usdz",
 ];
 
-/// 资源管理器式的文件名比较：忽略大小写，连续数字按数值比（IMG_2 在 IMG_10 前）
-fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
-    let (ab, bb) = (a.as_bytes(), b.as_bytes());
-
-    let (mut i, mut j) = (0usize, 0usize);
-
-    while i < ab.len() && j < bb.len() {
-        let (ca, cb) = (ab[i], bb[j]);
-
-        if ca.is_ascii_digit() && cb.is_ascii_digit() {
-            let i0 = i;
-
-            while i < ab.len() && ab[i].is_ascii_digit() {
-                i += 1;
-            }
-
-            let j0 = j;
-
-            while j < bb.len() && bb[j].is_ascii_digit() {
-                j += 1;
-            }
-
-            let sa = a[i0..i].trim_start_matches('0');
-
-            let sb = b[j0..j].trim_start_matches('0');
-
-            match sa.len().cmp(&sb.len()).then_with(|| sa.cmp(sb)) {
-                std::cmp::Ordering::Equal => continue,
-                o => return o,
-            }
-        }
-
-        let la = ca.to_ascii_lowercase();
-
-        let lb = cb.to_ascii_lowercase();
-
-        if la != lb {
-            return la.cmp(&lb);
-        }
-
-        i += 1;
-
-        j += 1;
-    }
-
-    (ab.len() - i).cmp(&(bb.len() - j))
-}
-
 // ─── 主应用 ───────────────────────────────────────
 
 struct PhotoViewApp {
@@ -402,18 +354,11 @@ impl PhotoViewApp {
             }
         }
 
+        // 与资源管理器"按名称"排序完全一致：Windows 上直接调 StrCmpLogicalW
         self.image_files.sort_by(|a, b| {
-            let an = a
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-
-            let bn = b
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-
-            natural_cmp(&an, &bn).then_with(|| a.cmp(b))
+            let an = a.file_name().unwrap_or(a.as_os_str());
+            let bn = b.file_name().unwrap_or(b.as_os_str());
+            win32::logical_name_cmp(an, bn).then_with(|| a.cmp(b))
         });
         self.last_scanned_dir = Some(dir.to_path_buf());
     }
@@ -3575,17 +3520,16 @@ mod tests {
     }
 
     #[test]
-    fn natural_cmp_matches_explorer_order() {
+    fn explorer_style_name_order() {
         use std::cmp::Ordering;
-        assert_eq!(natural_cmp("IMG_2.png", "IMG_10.png"), Ordering::Less);
-        assert_eq!(natural_cmp("page-002.jpg", "page-010.jpg"), Ordering::Less);
-        // 忽略大小写
-        assert_eq!(natural_cmp("a.PNG", "B.png"), Ordering::Less);
-        assert_eq!(natural_cmp("PhotoView", "photoview"), Ordering::Equal);
-        // 数值相同的不同写法视为相等，由 scan_dir 的完整路径次级比较决定先后
-        assert_eq!(natural_cmp("img2.jpg", "img02.jpg"), Ordering::Equal);
-        // 纯数字段之外仍按字符比
-        assert_eq!(natural_cmp("12.jpg", "12.png"), Ordering::Less);
+        use std::path::Path;
+        // 直接走系统 StrCmpLogicalW：与资源管理器"按名称"排序同一实现
+        let cmp = |a: &str, b: &str| {
+            win32::logical_name_cmp(Path::new(a).as_os_str(), Path::new(b).as_os_str())
+        };
+        assert_eq!(cmp("IMG_2.png", "IMG_10.png"), Ordering::Less);
+        assert_eq!(cmp("page-002.jpg", "page-010.jpg"), Ordering::Less);
+        assert_eq!(cmp("a.PNG", "A.png"), Ordering::Equal);
     }
 
     #[allow(clippy::field_reassign_with_default)]

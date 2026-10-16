@@ -13,6 +13,34 @@ pub(crate) use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindowThreadProcessId, IsWindowVisible,
 };
 
+// 与资源管理器同款的"名称"比较：直接调 shlwapi 的 StrCmpLogicalW
+// （windows 0.58 crate 未导出该函数，这里手写 dllimport 声明）
+#[cfg(target_os = "windows")]
+#[link(name = "shlwapi")]
+unsafe extern "system" {
+    fn StrCmpLogicalW(psz1: *const u16, psz2: *const u16) -> i32;
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn logical_name_cmp(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> std::cmp::Ordering {
+    use std::os::windows::ffi::OsStrExt;
+    let to_wide = |s: &std::ffi::OsStr| {
+        s.encode_wide()
+            .filter(|c| *c != 0)
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>()
+    };
+    let wa = to_wide(a);
+    let wb = to_wide(b);
+    let r = unsafe { StrCmpLogicalW(wa.as_ptr(), wb.as_ptr()) };
+    r.cmp(&0)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn logical_name_cmp(_a: &std::ffi::OsStr, _b: &std::ffi::OsStr) -> std::cmp::Ordering {
+    std::cmp::Ordering::Equal
+}
+
 /// 找到属于当前进程的第一个可见顶层窗口；多窗口同名时不会误伤其他实例
 #[cfg(target_os = "windows")]
 pub(crate) fn find_own_window() -> Option<HWND> {
