@@ -307,6 +307,7 @@ impl Model3D {
         self.mesh.triangle_count()
     }
 
+    #[cfg(test)]
     pub fn render(&mut self, width: usize, height: usize) -> Vec<Color32> {
         let w = width.max(2);
         let h = height.max(2);
@@ -2219,6 +2220,7 @@ fn edge(a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> f32 {
     (c.0 - a.0) * (b.1 - a.1) - (c.1 - a.1) * (b.0 - a.0)
 }
 
+#[cfg(test)]
 pub fn render_mesh(mesh: &Mesh, cam: &OrbitCamera, width: usize, height: usize) -> Vec<Color32> {
     render_mesh_ex(mesh, cam, width, height, false)
 }

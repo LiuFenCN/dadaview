@@ -2891,10 +2891,10 @@ impl eframe::App for PhotoViewApp {
                         ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
 
                     if let Some(texture) = &self.current_texture {
-                        if self.comic_mode && self.comic_second_texture.is_some() {
+                        if let Some(tex2) = self.comic_second_texture.as_ref()
+                            && self.comic_mode
+                        {
                             // ── 漫画模式：双图并排 ──
-
-                            let tex2 = self.comic_second_texture.as_ref().unwrap();
 
                             let h1 = self.img_h as f32;
 
@@ -3305,9 +3305,10 @@ fn main() -> eframe::Result<()> {
 
             cc.egui_ctx.set_fonts(fonts);
 
-            let mut app = PhotoViewApp::default();
-
-            app.initial_path = initial_path;
+            let app = PhotoViewApp {
+                initial_path,
+                ..Default::default()
+            };
 
             Ok(Box::new(app))
         }),

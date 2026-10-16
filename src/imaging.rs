@@ -200,52 +200,50 @@ pub(crate) fn load_gif_frames(path: &PathBuf, dest: Arc<Mutex<Option<Vec<AnimFra
         if let Ok(decoder) = image::codecs::gif::GifDecoder::new(reader) {
             let mut frames = Vec::new();
 
-            for frame in decoder.into_frames() {
-                if let Ok(frame) = frame {
-                    let delay_ms = {
-                        let (n, d) = frame.delay().numer_denom_ms();
+            for frame in decoder.into_frames().flatten() {
+                let delay_ms = {
+                    let (n, d) = frame.delay().numer_denom_ms();
 
-                        if d == 0 { 100u32 } else { n / d }
-                    };
+                    n.checked_div(d).unwrap_or(100)
+                };
 
-                    let delay_ms = if delay_ms == 0 { 100 } else { delay_ms };
+                let delay_ms = if delay_ms == 0 { 100 } else { delay_ms };
 
-                    let mut buffer = frame.into_buffer();
+                let mut buffer = frame.into_buffer();
 
-                    // 如果帧太大，需要缩小
+                // 如果帧太大，需要缩小
 
-                    let max_dim = buffer.width().max(buffer.height());
+                let max_dim = buffer.width().max(buffer.height());
 
-                    if max_dim > MAX_TEXTURE_DIM {
-                        let scale = MAX_TEXTURE_DIM as f32 / max_dim as f32;
+                if max_dim > MAX_TEXTURE_DIM {
+                    let scale = MAX_TEXTURE_DIM as f32 / max_dim as f32;
 
-                        let nw = (buffer.width() as f32 * scale).round() as u32;
+                    let nw = (buffer.width() as f32 * scale).round() as u32;
 
-                        let nh = (buffer.height() as f32 * scale).round() as u32;
+                    let nh = (buffer.height() as f32 * scale).round() as u32;
 
-                        let img = DynamicImage::ImageRgba8(buffer);
+                    let img = DynamicImage::ImageRgba8(buffer);
 
-                        let resized = img.resize_exact(nw, nh, FilterType::Triangle);
+                    let resized = img.resize_exact(nw, nh, FilterType::Triangle);
 
-                        buffer = resized.into_rgba8();
-                    }
-
-                    let tw = buffer.width() as usize;
-
-                    let th = buffer.height() as usize;
-
-                    let pixels: Vec<Color32> = buffer
-                        .pixels()
-                        .map(|p| Color32::from_rgba_unmultiplied(p.0[0], p.0[1], p.0[2], p.0[3]))
-                        .collect();
-
-                    frames.push(AnimFrame {
-                        pixels,
-                        tex_w: tw,
-                        tex_h: th,
-                        delay_ms,
-                    });
+                    buffer = resized.into_rgba8();
                 }
+
+                let tw = buffer.width() as usize;
+
+                let th = buffer.height() as usize;
+
+                let pixels: Vec<Color32> = buffer
+                    .pixels()
+                    .map(|p| Color32::from_rgba_unmultiplied(p.0[0], p.0[1], p.0[2], p.0[3]))
+                    .collect();
+
+                frames.push(AnimFrame {
+                    pixels,
+                    tex_w: tw,
+                    tex_h: th,
+                    delay_ms,
+                });
             }
 
             if frames.len() > 1 {
