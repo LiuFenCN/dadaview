@@ -1,0 +1,26 @@
+; simple square spiral for preview test
+G21 ; mm
+G90 ; absolute
+M82 ; absolute E
+G28 ; home
+G92 E0
+G1 Z0.2 F600
+; layer 0 square
+G1 X10 Y10 Z0.2 F1800
+G1 X30 Y10 E1.5 F1800
+G1 X30 Y30 E3.0
+G1 X10 Y30 E4.5
+G1 X10 Y10 E6.0
+; layer 1
+G1 X12 Y12 Z0.4
+G1 X28 Y12 E7.5
+G1 X28 Y28 E9.0
+G1 X12 Y28 E10.5
+G1 X12 Y12 E12.0
+; layer 2
+G1 X14 Y14 Z0.6
+G1 X26 Y14 E13.5
+G1 X26 Y26 E15.0
+G1 X14 Y26 E16.5
+G1 X14 Y14 E18.0
+M104 S0
