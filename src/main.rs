@@ -34,11 +34,6 @@ use settings::{
 };
 use win32::apply_win11_effects;
 
-#[cfg(target_os = "windows")]
-use win32::{
-    FindWindowW, HWND_NOTOPMOST, HWND_TOPMOST, PCWSTR, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
-};
-
 const SUPPORTED_EXTS: &[&str] = &[
     "png", "jpg", "jpeg", "bmp", "webp", "tiff", "tif", "gif", "ico", "obj", "stl", "gltf", "glb",
     "ply", "off", "3ds", "dae", "vtk", "wrl", "vrml", "amf", "3mf", "gcode", "gco", "g", "vrm",
@@ -1663,21 +1658,14 @@ impl PhotoViewApp {
         }
     }
 
-    /// 切换窗口置顶状态
-    fn toggle_always_on_top(&mut self) {
+    /// 切换窗口置顶状态（走 egui 视口命令，作用于本窗口，不受同名窗口干扰）
+    fn toggle_always_on_top(&mut self, ctx: &egui::Context) {
         self.always_on_top = !self.always_on_top;
-        #[cfg(target_os = "windows")]
-        unsafe {
-            let title: Vec<u16> = "PhotoView\0".encode_utf16().collect();
-            if let Ok(hwnd) = FindWindowW(None, PCWSTR(title.as_ptr())) {
-                let flag = if self.always_on_top {
-                    HWND_TOPMOST
-                } else {
-                    HWND_NOTOPMOST
-                };
-                let _ = SetWindowPos(hwnd, flag, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-            }
-        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if self.always_on_top {
+            egui::WindowLevel::AlwaysOnTop
+        } else {
+            egui::WindowLevel::Normal
+        }));
     }
 
     fn paint_info(&self, ui: &mut egui::Ui, rect: egui::Rect) {
@@ -2436,15 +2424,15 @@ impl eframe::App for PhotoViewApp {
                     self.anim_next_time = now + frame.delay_ms as f64 / 1000.0;
                 }
                 let fi = self.anim_current;
-                let stale =
-                    self.anim_textures
-                        .get(fi)
-                        .and_then(|o| o.as_ref())
-                        .is_none_or(|tex| {
-                            self.current_texture
-                                .as_ref()
-                                .is_none_or(|cur| cur.id() != tex.id())
-                        });
+                let stale = self
+                    .anim_textures
+                    .get(fi)
+                    .and_then(|o| o.as_ref())
+                    .is_none_or(|tex| {
+                        self.current_texture
+                            .as_ref()
+                            .is_none_or(|cur| cur.id() != tex.id())
+                    });
                 if stale {
                     let frame = &self.anim_frames[fi];
                     let tex = ctx.load_texture(
@@ -2766,7 +2754,7 @@ impl eframe::App for PhotoViewApp {
         }
 
         if should_toggle_topmost {
-            self.toggle_always_on_top();
+            self.toggle_always_on_top(ctx);
         }
 
         if should_prev {
