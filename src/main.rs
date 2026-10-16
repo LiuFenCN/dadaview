@@ -103,6 +103,12 @@ struct PhotoViewApp {
 
     show_settings: bool,
 
+    file_dialog_result: Arc<Mutex<Option<Option<PathBuf>>>>,
+
+    dialog_open: Arc<Mutex<bool>>,
+
+    info_cache: Option<(String, String)>,
+
     initial_path: Option<PathBuf>,
 
     settings: AppSettings,
@@ -213,6 +219,9 @@ impl Default for PhotoViewApp {
             comic_mode: false,
 
             show_settings: false,
+            file_dialog_result: Arc::new(Mutex::new(None)),
+            dialog_open: Arc::new(Mutex::new(false)),
+            info_cache: None,
 
             initial_path: None,
 
@@ -263,6 +272,62 @@ impl Default for PhotoViewApp {
 }
 
 impl PhotoViewApp {
+    /// 在独立线程弹系统文件对话框，结果经 file_dialog_result 回传，不阻塞 UI
+    fn spawn_file_dialog(&self) {
+        let dest = self.file_dialog_result.clone();
+        let flag = self.dialog_open.clone();
+        *flag.lock().unwrap() = true;
+        thread::spawn(move || {
+            let picked = FileDialog::new()
+                .add_filter(
+                    "图片",
+                    &[
+                        "png", "jpg", "jpeg", "bmp", "webp", "tiff", "tif", "gif", "ico",
+                    ],
+                )
+                .add_filter(
+                    "3D 模型",
+                    &[
+                        "obj", "stl", "gltf", "glb", "ply", "off", "3ds", "dae", "vtk", "wrl",
+                        "vrml", "amf", "vrm", "fbx", "pmx", "pmd", "usd", "usda", "usdc", "usdz",
+                    ],
+                )
+                .add_filter("3D 打印", &["stl", "3mf", "amf", "gcode", "gco", "obj"])
+                .add_filter(
+                    "所有支持",
+                    &[
+                        "png", "jpg", "jpeg", "bmp", "webp", "tiff", "tif", "gif", "ico", "obj",
+                        "stl", "gltf", "glb", "ply", "off", "3ds", "dae", "vtk", "wrl", "vrml",
+                        "amf", "3mf", "gcode", "gco", "g", "vrm", "fbx", "pmx", "pmd", "usd",
+                        "usda", "usdc", "usdz",
+                    ],
+                )
+                .pick_file();
+            *dest.lock().unwrap() = Some(picked);
+            *flag.lock().unwrap() = false;
+        });
+    }
+
+    /// 文件切换时缓存大小/修改时间，信息面板不再每帧打磁盘
+    fn refresh_info_cache(&mut self) {
+        self.info_cache = self
+            .current_path
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| {
+                let size = human_size(m.len());
+                let modified = m
+                    .modified()
+                    .ok()
+                    .map(|t| {
+                        let dt: chrono::DateTime<chrono::Local> = t.into();
+                        dt.format("%Y-%m-%d %H:%M:%S").to_string()
+                    })
+                    .unwrap_or_else(|| "—".into());
+                (size, modified)
+            });
+    }
+
     fn scan_dir(&mut self, dir: &std::path::Path) {
         if !dir.is_dir() {
             return;
@@ -320,6 +385,7 @@ impl PhotoViewApp {
         self.is_minimized = false;
 
         self.is_loading = true;
+        self.refresh_info_cache();
 
         self.deferred_resize_time = None; // 首次打开不延迟
 
@@ -452,6 +518,7 @@ impl PhotoViewApp {
         self.anim_frames.clear();
 
         self.is_loading = true;
+        self.refresh_info_cache();
 
         self.is_minimized = false;
 
@@ -499,6 +566,7 @@ impl PhotoViewApp {
         self.is_minimized = false;
 
         self.is_loading = true;
+        self.refresh_info_cache();
 
         // 清除动画状态
 
@@ -1620,24 +1688,10 @@ impl PhotoViewApp {
             .and_then(|n| n.to_str())
             .unwrap_or("unknown");
 
-        let file_size = self
-            .current_path
-            .as_ref()
-            .and_then(|p| std::fs::metadata(p).ok())
-            .map(|m| human_size(m.len()))
-            .unwrap_or_else(|| "—".into());
-
-        let modified = self
-            .current_path
-            .as_ref()
-            .and_then(|p| std::fs::metadata(p).ok())
-            .and_then(|m| m.modified().ok())
-            .map(|t| {
-                let dt: chrono::DateTime<chrono::Local> = t.into();
-
-                dt.format("%Y-%m-%d %H:%M:%S").to_string()
-            })
-            .unwrap_or_else(|| "—".into());
+        let (file_size, modified) = self
+            .info_cache
+            .clone()
+            .unwrap_or_else(|| ("—".into(), "—".into()));
 
         let ext = self
             .current_path
@@ -2309,6 +2363,18 @@ impl eframe::App for PhotoViewApp {
 
         self.apply_model_pending(ctx);
 
+        // 异步文件对话框结果回收
+        let dialog_result = self.file_dialog_result.lock().unwrap().take();
+        if let Some(picked) = dialog_result {
+            if let Some(path) = picked {
+                self.open_image(path, ctx);
+            }
+            ctx.request_repaint();
+        } else if self.show_settings || *self.dialog_open.lock().unwrap() {
+            // 设置面板或对话框打开期间保持低频轮询
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+
         //
         if self.should_close_next_frame
             && !ctx.input(|i| i.pointer.button_down(egui::PointerButton::Secondary))
@@ -2362,7 +2428,7 @@ impl eframe::App for PhotoViewApp {
             let need_upload = self
                 .anim_textures
                 .get(self.anim_current)
-                .map_or(true, |t| t.is_none());
+                .is_none_or(|t| t.is_none());
             if now >= self.anim_next_time || need_upload {
                 if now >= self.anim_next_time {
                     self.anim_current = (self.anim_current + 1) % self.anim_frames.len();
@@ -2374,10 +2440,10 @@ impl eframe::App for PhotoViewApp {
                     self.anim_textures
                         .get(fi)
                         .and_then(|o| o.as_ref())
-                        .map_or(true, |tex| {
+                        .is_none_or(|tex| {
                             self.current_texture
                                 .as_ref()
-                                .map_or(true, |cur| cur.id() != tex.id())
+                                .is_none_or(|cur| cur.id() != tex.id())
                         });
                 if stale {
                     let frame = &self.anim_frames[fi];
@@ -2777,39 +2843,8 @@ impl eframe::App for PhotoViewApp {
                         if ui
                             .button(RichText::new("📁 打开文件...").size(14.0))
                             .clicked()
-                            && let Some(path) = FileDialog::new()
-                                .add_filter(
-                                    "图片",
-                                    &[
-                                        "png", "jpg", "jpeg", "bmp", "webp", "tiff", "tif", "gif",
-                                        "ico",
-                                    ],
-                                )
-                                .add_filter(
-                                    "3D 模型",
-                                    &[
-                                        "obj", "stl", "gltf", "glb", "ply", "off", "3ds", "dae",
-                                        "vtk", "wrl", "vrml", "amf", "vrm", "fbx", "pmx", "pmd",
-                                        "usd", "usda", "usdc", "usdz",
-                                    ],
-                                )
-                                .add_filter(
-                                    "3D 打印",
-                                    &["stl", "3mf", "amf", "gcode", "gco", "obj"],
-                                )
-                                .add_filter(
-                                    "所有支持",
-                                    &[
-                                        "png", "jpg", "jpeg", "bmp", "webp", "tiff", "tif", "gif",
-                                        "ico", "obj", "stl", "gltf", "glb", "ply", "off", "3ds",
-                                        "dae", "vtk", "wrl", "vrml", "amf", "3mf", "gcode", "gco",
-                                        "g", "vrm", "fbx", "pmx", "pmd", "usd", "usda", "usdc",
-                                        "usdz",
-                                    ],
-                                )
-                                .pick_file()
                         {
-                            self.open_image(path, ctx);
+                            self.spawn_file_dialog();
                         }
 
                         ui.add_space(16.0);
