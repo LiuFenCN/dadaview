@@ -2,6 +2,10 @@
 name = "photoview"
 version = "0.1.0"
 edition = "2024"
+license = "AGPL-3.0-only"
+description = "Windows image viewer with 3D model preview"
+repository = "https://github.com/LiuFenCN/photoview"
+readme = "README.md"
 
 [dependencies]
 eframe = "0.28"
