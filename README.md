@@ -23,7 +23,8 @@
 
 从 [Releases](https://github.com/LiuFenCN/dadaview/releases/latest) 下载：
 
-- `DaDaView-*-x64-setup.msi` —— 安装版，默认装到 `C:\Program Files\DaDaView`，安装向导中可自定义安装目录（需要管理员权限）
+- `DaDaView-*-x64-setup.exe` —— 安装版（推荐）：双击后自动请求管理员权限，内置 MSI，默认装到 `C:\Program Files\DaDaView`，向导中可自定义安装目录；支持 `--quiet` 静默安装
+- `DaDaView-*-x64-setup.msi` —— 同一安装包的 MSI，供批量部署或高级用户使用，需要从管理员命令提示符运行
 - `DaDaView-*-x64-portable.zip` —— 免安装版，解压后直接运行 `dadaview.exe`，无需管理员权限
 
 安装版会创建桌面和开始菜单快捷方式；安装位置在向导的“目标文件夹”页可浏览或直接输入，例如改到 `D:\Programs\DaDaView`。安装包未做代码签名，首次运行时 Windows SmartScreen 可能提示“未知发布者”，选择“更多信息 → 仍要运行”即可。
@@ -47,6 +48,13 @@ cargo build --release
 ```bash
 candle.exe -arch x64 -out installer/obj/dadaview.wixobj installer/dadaview.wxs
 light.exe -ext WixUIExtension -cultures:zh-CN -out dist/DaDaView-0.1.0-x64-setup.msi installer/obj/dadaview.wixobj
+```
+
+安装版启动器在 [installer/launcher](installer/launcher)，会把上面的 MSI 内嵌进 exe 并自动请求管理员权限，因此必须在 MSI 生成后再编译：
+
+```bash
+cargo build --release --manifest-path installer/launcher/Cargo.toml
+cp installer/launcher/target/release/dadaview-setup.exe dist/DaDaView-0.1.0-x64-setup.exe
 ```
 
 ## 测试 · Tests

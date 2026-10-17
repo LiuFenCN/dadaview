@@ -4,4 +4,5 @@
 /_archive
 /dist
 /installer/obj
+/installer/launcher/target
 *.exe
