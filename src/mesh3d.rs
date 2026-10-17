@@ -430,6 +430,8 @@ pub struct Model3D {
     pub camera: OrbitCamera,
     pub format_label: String,
     pub needs_redraw: bool,
+    /// glTF 外部贴图缺失数量（>0 时以无贴图模式显示）
+    pub missing_textures: usize,
     last_render_size: (usize, usize),
 }
 
@@ -440,10 +442,15 @@ impl Model3D {
             .and_then(|e| e.to_str())
             .map(|e| e.to_lowercase())
             .unwrap_or_default();
+        let mut missing_textures = 0usize;
         let mesh = match ext.as_str() {
             "obj" => load_obj(path)?,
             "stl" => load_stl(path)?,
-            "gltf" | "glb" | "vrm" => load_gltf(path)?,
+            "gltf" | "glb" | "vrm" => {
+                let (m, n) = load_gltf(path)?;
+                missing_textures = n;
+                m
+            }
             "ply" => load_ply(path)?,
             "off" => load_off(path)?,
             "3ds" => load_3ds(path)?,
@@ -469,6 +476,7 @@ impl Model3D {
             camera: OrbitCamera::from_bounds(mn, mx),
             format_label: ext.to_uppercase(),
             needs_redraw: true,
+            missing_textures,
             last_render_size: (0, 0),
         })
     }
@@ -742,8 +750,71 @@ fn texel_color(lin: [f32; 3], mul: [f32; 3], shade: f32) -> Color32 {
     )
 }
 
-fn load_gltf(path: &Path) -> anyhow::Result<Mesh> {
-    let (document, buffers, images) = gltf::import(path)?;
+/// gltf::import 的宽容版：外部 .bin / 贴图文件缺失时不整体失败。
+/// 常见场景：Blender 导出的 .gltf 把 textures/ 目录删了或拷贝时漏掉，
+/// 而几何数据（.bin）完好——查看器应当能打开模型本体。
+/// 返回 (文档, buffers, images, 缺失贴图数)。
+/// - buffer 缺失/过短 → 按声明 length 填零（访问器读到 0，不会 panic）
+/// - image 缺失/解码失败 → 1×1 中性灰占位（材质退回 baseColorFactor 纯色）
+fn import_gltf_lenient(
+    path: &Path,
+) -> anyhow::Result<(
+    gltf::Document,
+    Vec<gltf::buffer::Data>,
+    Vec<gltf::image::Data>,
+    usize,
+)> {
+    use std::fs;
+    use std::io::BufReader;
+
+    let base = path.parent().unwrap_or_else(|| Path::new("./"));
+    let file = fs::File::open(path).map_err(|e| anyhow::anyhow!("无法打开 glTF 文件: {e}"))?;
+    let reader = BufReader::new(file);
+    let gltf = gltf::Gltf::from_reader(reader)?;
+    let document = gltf.document;
+    let mut blob = gltf.blob;
+
+    // ── buffers：读失败就按 buffer.length() 补零，保证后续切片不越界 ──
+    let mut buffers = Vec::with_capacity(document.buffers().len());
+    for buffer in document.buffers() {
+        let mut data = match gltf::buffer::Data::from_source_and_blob(
+            buffer.source(),
+            Some(base),
+            &mut blob,
+        ) {
+            Ok(d) => d,
+            Err(_) => gltf::buffer::Data(Vec::new()),
+        };
+        // gltf-rs 的 import 会校验长度并拒绝短 buffer；这里放行并补齐，
+        // 让引用到缺失区段的访问器读到 0 而不是让整个加载失败
+        if data.0.len() < buffer.length() {
+            data.0.resize(buffer.length(), 0);
+        }
+        buffers.push(data);
+    }
+
+    // ── images：缺失的用 1×1 中性灰占位，材质仍按 baseColorFactor 上色 ──
+    let mut missing = 0usize;
+    let mut images = Vec::with_capacity(document.images().len());
+    for image in document.images() {
+        match gltf::image::Data::from_source(image.source(), Some(base), &buffers) {
+            Ok(d) => images.push(d),
+            Err(_) => {
+                missing += 1;
+                images.push(gltf::image::Data {
+                    pixels: vec![204, 204, 204, 255],
+                    format: gltf::image::Format::R8G8B8A8,
+                    width: 1,
+                    height: 1,
+                });
+            }
+        }
+    }
+    Ok((document, buffers, images, missing))
+}
+
+fn load_gltf(path: &Path) -> anyhow::Result<(Mesh, usize)> {
+    let (document, buffers, images, missing_textures) = import_gltf_lenient(path)?;
     // 同一张图被多个材质引用时只解码一次（Arc 共享，append_mesh 靠指针去重）
     let mut tex_cache: Vec<Option<std::sync::Arc<Texture>>> = vec![None; document.images().len()];
     let mut out = Mesh::default();
@@ -876,7 +947,7 @@ fn load_gltf(path: &Path) -> anyhow::Result<Mesh> {
         anyhow::bail!("glTF 中没有三角网格");
     }
     out.ensure_normals();
-    Ok(out)
+    Ok((out, missing_textures))
 }
 
 fn find_header_end(data: &[u8]) -> Option<usize> {
@@ -2191,6 +2262,8 @@ enum FbxProp {
     F64s(Vec<f64>),
     I32s(Vec<i32>),
     I64s(Vec<i64>),
+    /// 标量整型：Model/Geometry 的对象 ID、Connections 的连接关系都用它
+    I64Scalar(i64),
     Other,
 }
 
@@ -2255,14 +2328,24 @@ impl<'a> FbxCur<'a> {
                 self.u16()?;
                 Some(FbxProp::Other)
             }
-            b'B' | b'I' | b'F' | b'D' | b'L' => {
-                let n = match t {
-                    b'B' => 1,
-                    b'I' | b'F' => 4,
-                    b'D' | b'L' => 8,
-                    _ => 0,
-                };
-                self.bytes(n)?;
+            b'B' => {
+                self.bytes(1)?;
+                Some(FbxProp::Other)
+            }
+            b'F' => {
+                self.bytes(4)?;
+                Some(FbxProp::Other)
+            }
+            b'D' => {
+                self.bytes(8)?;
+                Some(FbxProp::Other)
+            }
+            b'L' => {
+                let v = self.u64()? as i64;
+                Some(FbxProp::I64Scalar(v))
+            }
+            b'I' => {
+                let _ = self.u32()?;
                 Some(FbxProp::Other)
             }
             b'S' | b'R' => {
@@ -2401,11 +2484,39 @@ impl FbxProp {
 }
 
 /// 一个 Geometry 子树里累积的网格数据：顶点与索引往往分散在不同节点，
-/// 要收集齐了才结算成一块网格
+/// 要收集齐了才结算成一块网格。poly_idx 保留原始的 PolygonVertexIndex
+/// （负数收尾表示多边形结束），三角化留给结算时做。
 #[derive(Default)]
 struct FbxGeom {
+    id: i64,
     verts: Option<Vec<[f32; 3]>>,
-    tris: Option<Vec<u32>>,
+    poly_idx: Option<Vec<i32>>,
+    normals: Option<FbxNormals>,
+}
+
+/// FBX 法线层的三种映射方式（MappingInformationType）
+enum FbxNormals {
+    /// ByPolygonVertex：每个多边形角一条法线（Blender/Maya 默认）
+    PerCorner(Vec<[f32; 3]>),
+    /// ByVertice：每个顶点一条
+    PerVertex(Vec<[f32; 3]>),
+    /// ByPolygon：每个多边形一条（整体 Flat）
+    PerPoly(Vec<[f32; 3]>),
+}
+
+/// 结算完成的网格数据：等 Connections 解析出 Model 变换后统一处理
+struct FbxGeomData {
+    id: i64,
+    verts: Vec<[f32; 3]>,
+    poly_idx: Vec<i32>,
+    normals: Option<FbxNormals>,
+}
+
+/// FBX 对象节点（Model）：局部 TRS + 父节点 ID（-1 = 无父）
+struct FbxModel {
+    id: i64,
+    local: Mat4,
+    parent: i64,
 }
 
 fn fbx_verts_from(props: &[FbxProp]) -> Option<Vec<[f32; 3]>> {
@@ -2423,14 +2534,55 @@ fn fbx_verts_from(props: &[FbxProp]) -> Option<Vec<[f32; 3]>> {
     }
 }
 
-fn fbx_tris_from(props: &[FbxProp]) -> Option<Vec<u32>> {
-    let ix = props.iter().find_map(FbxProp::i32s)?;
-    if ix.len() < 3 {
-        return None;
+/// 取原始 PolygonVertexIndex 数组（含负数收尾）
+fn fbx_poly_idx_from(props: &[FbxProp]) -> Option<Vec<i32>> {
+    if let Some(v) = props.iter().find_map(FbxProp::i32s) {
+        if v.len() >= 3 {
+            return Some(v);
+        }
     }
-    let mut t = Vec::new();
-    fbx_fan_poly(&ix, &mut t);
-    Some(t)
+    // 'l'（int64）数组也会落到 I64s
+    props
+        .iter()
+        .find_map(|p| match p {
+            FbxProp::I64s(v) if v.len() >= 3 => Some(v.iter().map(|&x| x as i32).collect()),
+            _ => None,
+        })
+}
+
+/// 从属性列表里找命名标量整型（如 RotationOrder）
+fn fbx_p_named_int(props: &[FbxProp], key: &str) -> Option<i32> {
+    for (i, p) in props.iter().enumerate() {
+        let FbxProp::Str(s) = p else { continue };
+        if s != key {
+            continue;
+        }
+        for q in &props[i + 1..] {
+            match q {
+                FbxProp::I32s(v) if !v.is_empty() => return Some(v[0]),
+                FbxProp::I64s(v) if !v.is_empty() => return Some(v[0] as i32),
+                FbxProp::I64Scalar(v) => return Some(*v as i32),
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// 从属性列表里找命名 Vec3（如 Lcl Translation）
+fn fbx_p_named_vec3(props: &[FbxProp], key: &str) -> Option<[f64; 3]> {
+    for (i, p) in props.iter().enumerate() {
+        let FbxProp::Str(name) = p else { continue };
+        if name != key {
+            continue;
+        }
+        if let Some(v) = props[i + 1..].iter().find_map(FbxProp::f64s) {
+            if v.len() >= 3 {
+                return Some([v[0], v[1], v[2]]);
+            }
+        }
+    }
+    None
 }
 
 /// 网格数据有两种写法，都要支持：
@@ -2440,7 +2592,9 @@ fn fbx_tris_from(props: &[FbxProp]) -> Option<Vec<u32>> {
 fn fbx_props_take(node: &str, props: &[FbxProp], cur: &mut FbxGeom) {
     match node {
         "Vertices" | "ControlPoints" if cur.verts.is_none() => cur.verts = fbx_verts_from(props),
-        "PolygonVertexIndex" | "Indexes" if cur.tris.is_none() => cur.tris = fbx_tris_from(props),
+        "PolygonVertexIndex" | "Indexes" if cur.poly_idx.is_none() => {
+            cur.poly_idx = fbx_poly_idx_from(props)
+        }
         _ => {}
     }
     for (i, p) in props.iter().enumerate() {
@@ -2448,41 +2602,132 @@ fn fbx_props_take(node: &str, props: &[FbxProp], cur: &mut FbxGeom) {
         let rest = &props[i + 1..];
         match name.as_str() {
             "Vertices" | "ControlPoints" if cur.verts.is_none() => cur.verts = fbx_verts_from(rest),
-            "PolygonVertexIndex" | "Indexes" if cur.tris.is_none() => {
-                cur.tris = fbx_tris_from(rest)
+            "PolygonVertexIndex" | "Indexes" if cur.poly_idx.is_none() => {
+                cur.poly_idx = fbx_poly_idx_from(rest)
             }
             _ => {}
         }
     }
 }
 
-/// 顶点与索引都齐了才并入总网格
-fn fbx_flush(cur: &mut FbxGeom, out: &mut (Vec<[f32; 3]>, Vec<u32>)) {
-    let (Some(verts), Some(tris)) = (cur.verts.take(), cur.tris.take()) else {
-        return;
-    };
-    let n = verts.len() as u32;
-    let tris: Vec<u32> = tris.into_iter().take_while(|&i| i < n).collect();
-    if tris.len() < 3 {
-        return;
-    }
-    let base = out.0.len() as u32;
-    out.0.extend(verts);
-    out.1.extend(tris.into_iter().map(|i| i + base));
-}
-
-/// 把 PolygonVertexIndex（负数收尾）展开成三角形
-fn fbx_fan_poly(src: &[i32], out: &mut Vec<u32>) {
-    let mut poly = Vec::new();
-    for &v in src {
-        if v < 0 {
-            poly.push((-v - 1) as u32);
-            fan_triangles(out, &poly);
-            poly.clear();
-        } else {
-            poly.push(v as u32);
+/// 解析 LayerElementNormal 子树，返回法线数据
+fn fbx_normals_from(children: &[(String, Vec<FbxProp>)]) -> Option<FbxNormals> {
+    let mut mapping = String::new();
+    let mut reference = String::new();
+    let mut normals: Option<Vec<[f32; 3]>> = None;
+    let mut normals_index: Option<Vec<i32>> = None;
+    for (name, props) in children {
+        match name.as_str() {
+            "MappingInformationType" => {
+                if let Some(FbxProp::Str(s)) = props.first() {
+                    mapping = s.clone();
+                }
+            }
+            "ReferenceInformationType" => {
+                if let Some(FbxProp::Str(s)) = props.first() {
+                    reference = s.clone();
+                }
+            }
+            "Normals" => {
+                if let Some(v) = props.iter().find_map(FbxProp::f64s) {
+                    if v.len() >= 3 && v.len() % 3 == 0 {
+                        normals = Some(
+                            v.as_chunks::<3>()
+                                .0
+                                .iter()
+                                .map(|c| [c[0] as f32, c[1] as f32, c[2] as f32])
+                                .collect(),
+                        );
+                    }
+                }
+            }
+            "NormalsIndex" => {
+                if let Some(v) = props.iter().find_map(FbxProp::i32s) {
+                    normals_index = Some(v);
+                }
+            }
+            _ => {}
         }
     }
+    let normals = normals?;
+    // IndexToDirect：先用索引表展开成 Direct
+    let normals = if reference == "IndexToDirect" {
+        let idx = normals_index?;
+        idx.iter()
+            .map(|&i| normals.get(i as usize).copied().unwrap_or([0.0, 0.0, 1.0]))
+            .collect()
+    } else {
+        normals
+    };
+    match mapping.as_str() {
+        "ByPolygonVertex" => Some(FbxNormals::PerCorner(normals)),
+        "ByVertice" | "ByVertex" => Some(FbxNormals::PerVertex(normals)),
+        "ByPolygon" => Some(FbxNormals::PerPoly(normals)),
+        _ => None,
+    }
+}
+
+/// FBX 欧拉角（度）→ 四元数。order 为 FBX EulerOrder 枚举，默认 0=XYZ。
+fn fbx_euler_to_quat(deg: [f64; 3], order: i32) -> glam::Quat {
+    let x = (deg[0] as f32).to_radians();
+    let y = (deg[1] as f32).to_radians();
+    let z = (deg[2] as f32).to_radians();
+    let qx = glam::Quat::from_rotation_x(x);
+    let qy = glam::Quat::from_rotation_y(y);
+    let qz = glam::Quat::from_rotation_z(z);
+    match order {
+        1 => qx * qz * qy, // XZY
+        2 => qy * qz * qx, // YZX
+        3 => qy * qx * qz, // YXZ
+        4 => qz * qx * qy, // ZXY
+        5 => qz * qy * qx, // ZYX
+        _ => qx * qy * qz, // XYZ（FBX 默认）
+    }
+}
+
+/// 从 Model 的 P 记录属性里取 Lcl TRS，组成本地矩阵。
+/// p_props 是 Model 子树里全部 P 记录的属性列表。
+fn fbx_model_local(p_props: &[Vec<FbxProp>]) -> Mat4 {
+    let mut t = [0.0f64; 3];
+    let mut r = [0.0f64; 3];
+    let mut s = [1.0f64; 3];
+    let mut order = 0i32;
+    for props in p_props {
+        if let Some(v) = fbx_p_named_vec3(props, "Lcl Translation") {
+            t = v;
+        }
+        if let Some(v) = fbx_p_named_vec3(props, "Lcl Rotation") {
+            r = v;
+        }
+        if let Some(v) = fbx_p_named_vec3(props, "Lcl Scaling") {
+            s = v;
+        }
+        if let Some(v) = fbx_p_named_int(props, "RotationOrder") {
+            order = v;
+        }
+    }
+    let rot = fbx_euler_to_quat(r, order);
+    Mat4::from_scale_rotation_translation(
+        Vec3::new(s[0] as f32, s[1] as f32, s[2] as f32),
+        rot,
+        Vec3::new(t[0] as f32, t[1] as f32, t[2] as f32),
+    )
+}
+
+/// 沿 parent 链累乘出世界矩阵（防环）
+fn fbx_model_world(models: &[FbxModel], id: i64) -> Mat4 {
+    let mut m = Mat4::IDENTITY;
+    let mut cur = id;
+    let mut guard = 0;
+    while cur >= 0 && guard < 256 {
+        guard += 1;
+        let Some(mo) = models.iter().find(|m| m.id == cur) else {
+            break;
+        };
+        m = mo.local * m;
+        cur = mo.parent;
+    }
+    m
 }
 
 /// 校验 p 处是否像一个节点记录：结束偏移在文件内、属性计数与列表长度自洽、
@@ -2511,6 +2756,215 @@ fn fbx_looks_like_node(c: &FbxCur, p: usize) -> bool {
     name.iter().all(|b| b.is_ascii_graphic() || *b == b' ')
 }
 
+/// 扫描期的累积状态
+struct FbxScan {
+    geoms: Vec<FbxGeomData>,
+    cur: FbxGeom,
+    models: Vec<FbxModel>,
+}
+
+impl FbxScan {
+    /// Geometry 数据齐了才结算
+    fn flush(&mut self) {
+        let (Some(verts), Some(poly_idx)) = (self.cur.verts.take(), self.cur.poly_idx.take()) else {
+            self.cur.normals = None;
+            return;
+        };
+        if verts.len() < 3 || poly_idx.len() < 3 {
+            self.cur.normals = None;
+            return;
+        }
+        // 真正的 PolygonVertexIndex 每个多边形都以负数收尾；
+        // 无任何收尾符的数组是 Edges/索引表之类的死数据，不是网格
+        if !poly_idx.iter().any(|&i| i < 0) {
+            self.cur.normals = None;
+            return;
+        }
+        let n = verts.len() as u32;
+        let poly_idx: Vec<i32> = poly_idx
+            .into_iter()
+            .filter(|&i| i.unsigned_abs() <= n)
+            .collect();
+        if poly_idx.len() < 3 {
+            self.cur.normals = None;
+            return;
+        }
+        let id = std::mem::take(&mut self.cur.id);
+        let normals = self.cur.normals.take();
+        self.geoms.push(FbxGeomData {
+            id,
+            verts,
+            poly_idx,
+            normals,
+        });
+    }
+}
+
+/// 读一个节点段的全部直接子节点（名字+属性+子节点范围），
+/// 用于 Model / LayerElementNormal / Connections
+fn fbx_read_children(
+    d: &[u8],
+    ver: u32,
+    mut p: usize,
+    end: usize,
+    out: &mut Vec<(String, Vec<FbxProp>, usize, usize)>,
+) {
+    while p + if ver >= 7500 { 8 } else { 4 } <= end {
+        let mut c = FbxCur { d, p, ver };
+        let sz = c.off_size();
+        let Some(node_end) = c.off() else { return };
+        c.p -= sz;
+        if node_end == 0 || node_end <= c.p || node_end > end {
+            return;
+        }
+        match fbx_read_node(&mut c, node_end) {
+            Some((name, props, children_at)) => {
+                out.push((name, props, children_at, node_end));
+                p = node_end;
+            }
+            None => return,
+        }
+    }
+}
+
+/// 递归收集子树里全部 P 记录的属性（P 只出现在 Properties70 下）
+fn fbx_collect_p_props(
+    d: &[u8],
+    ver: u32,
+    start: usize,
+    end: usize,
+    out: &mut Vec<Vec<FbxProp>>,
+) {
+    let mut kids: Vec<(String, Vec<FbxProp>, usize, usize)> = Vec::new();
+    fbx_read_children(d, ver, start, end, &mut kids);
+    for (name, props, cs, ce) in kids {
+        if name == "P" {
+            out.push(props);
+        }
+        fbx_collect_p_props(d, ver, cs, ce, out);
+    }
+}
+
+/// 无 FBX 法线的几何体：自己算平滑法线（与原 ensure_normals 行为一致）
+fn fbx_smooth_normals(verts: &[[f32; 3]], poly_idx: &[i32]) -> Vec<[f32; 3]> {
+    let mut acc = vec![[0.0f32; 3]; verts.len()];
+    let mut poly: Vec<u32> = Vec::new();
+    for &v in poly_idx {
+        if v < 0 {
+            poly.push((-v - 1) as u32);
+            if poly.len() >= 3 {
+                let p0 = Vec3::from(verts[poly[0] as usize]);
+                let p1 = Vec3::from(verts[poly[1] as usize]);
+                let p2 = Vec3::from(verts[poly[2] as usize]);
+                let n = (p1 - p0).cross(p2 - p0);
+                for &i in &poly {
+                    let c = Vec3::from(acc[i as usize]) + n;
+                    acc[i as usize] = [c.x, c.y, c.z];
+                }
+            }
+            poly.clear();
+        } else {
+            poly.push(v as u32);
+        }
+    }
+    acc.iter_mut()
+        .map(|n| {
+            let v = Vec3::from(*n);
+            let len = v.length();
+            if len > 1e-12 {
+                let u = v / len;
+                [u.x, u.y, u.z]
+            } else {
+                [0.0, 1.0, 0.0]
+            }
+        })
+        .collect()
+}
+
+/// 结算一块几何：应用 Model 世界矩阵，展开成逐角顶点（带 FBX 法线时逐角取值，
+/// 否则用平滑法线），追加进总网格。逐角展开保证 normals 与 positions 等长。
+fn fbx_emit_geom(
+    g: FbxGeomData,
+    world: Mat4,
+    out_pos: &mut Vec<[f32; 3]>,
+    out_idx: &mut Vec<u32>,
+    out_nrm: &mut Vec<[f32; 3]>,
+) {
+    if g.verts.is_empty() || g.poly_idx.is_empty() {
+        return;
+    }
+    let nmat = world.inverse().transpose();
+    let push_normal = |n: [f32; 3], out_nrm: &mut Vec<[f32; 3]>| {
+        let wn = nmat.transform_vector3(Vec3::from(n));
+        let wn = if wn.length_squared() > 1e-20 {
+            wn.normalize()
+        } else {
+            Vec3::Y
+        };
+        out_nrm.push([wn.x, wn.y, wn.z]);
+    };
+
+    match &g.normals {
+        // 无法线：索引式追加 + 平滑法线（与历史行为一致，省内存）
+        None => {
+            let smooth = fbx_smooth_normals(&g.verts, &g.poly_idx);
+            let base = out_pos.len() as u32;
+            for (i, &p) in g.verts.iter().enumerate() {
+                let wp = world.transform_point3(Vec3::from(p));
+                out_pos.push([wp.x, wp.y, wp.z]);
+                push_normal(smooth[i], out_nrm);
+            }
+            let mut poly: Vec<u32> = Vec::new();
+            for &raw in &g.poly_idx {
+                if raw < 0 {
+                    poly.push((-raw - 1) as u32 + base);
+                    fan_triangles(out_idx, &poly);
+                    poly.clear();
+                } else {
+                    poly.push(raw as u32 + base);
+                }
+            }
+        }
+        // 有 FBX 法线：逐角展开（PerCorner 法线需要按角存放顶点）
+        Some(_) => {
+            let mut poly: Vec<u32> = Vec::new();
+            let mut corner = 0usize;
+            let mut poly_no = 0usize;
+            for &raw in &g.poly_idx {
+                let vi = (if raw < 0 { -raw - 1 } else { raw }) as usize;
+                let Some(&p) = g.verts.get(vi) else {
+                    corner += 1;
+                    continue;
+                };
+                let wp = world.transform_point3(Vec3::from(p));
+                out_pos.push([wp.x, wp.y, wp.z]);
+                let n = match &g.normals {
+                    Some(FbxNormals::PerCorner(v)) => {
+                        v.get(corner).copied().unwrap_or([0.0, 1.0, 0.0])
+                    }
+                    Some(FbxNormals::PerVertex(v)) => {
+                        v.get(vi).copied().unwrap_or([0.0, 1.0, 0.0])
+                    }
+                    Some(FbxNormals::PerPoly(v)) => {
+                        v.get(poly_no).copied().unwrap_or([0.0, 1.0, 0.0])
+                    }
+                    None => [0.0, 1.0, 0.0],
+                };
+                corner += 1;
+                push_normal(n, out_nrm);
+                poly.push(out_pos.len() as u32 - 1);
+                if raw < 0 {
+                    fan_triangles(out_idx, &poly);
+                    poly.clear();
+                    poly_no += 1;
+                }
+            }
+            // 注意：不给未收尾的残段兜底三角化——FBX 多边形必须负数收尾，
+            // 没收尾的残段是坏数据，fan 出垃圾三角形不如丢弃
+        }
+    }
+}
+
 fn load_fbx_binary(data: &[u8]) -> anyhow::Result<Mesh> {
     if data.len() < 32 {
         anyhow::bail!("FBX 文件过小");
@@ -2535,18 +2989,14 @@ fn load_fbx_binary(data: &[u8]) -> anyhow::Result<Mesh> {
         ver,
     };
 
-    let mut out = (Vec::<[f32; 3]>::new(), Vec::<u32>::new());
-    let mut cur = FbxGeom::default();
+    let mut scan = FbxScan {
+        geoms: Vec::new(),
+        cur: FbxGeom::default(),
+        models: Vec::new(),
+    };
 
-    fn scan(
-        c: &mut FbxCur,
-        end: usize,
-        depth: u32,
-        inside_geometry: bool,
-        cur: &mut FbxGeom,
-        out: &mut (Vec<[f32; 3]>, Vec<u32>),
-    ) {
-        if depth > 16 {
+    fn walk(c: &mut FbxCur, end: usize, depth: u32, inside_geometry: bool, scan: &mut FbxScan) {
+        if depth > 24 {
             return;
         }
         while c.p + c.off_size() <= end {
@@ -2565,30 +3015,63 @@ fn load_fbx_binary(data: &[u8]) -> anyhow::Result<Mesh> {
             }
             match fbx_read_node(c, node_end) {
                 Some((name, props, children_at)) => {
+                    // Model 节点：记录 ID + 局部 TRS（Blender 把 Model 平铺在
+                    // Objects 下，父子关系由 Connections 的 OO 记录给出）
+                    if name == "Model"
+                        && let Some(id) = props.iter().find_map(|p| match p {
+                            FbxProp::I64Scalar(v) => Some(*v),
+                            _ => None,
+                        })
+                    {
+                        let mut p_props: Vec<Vec<FbxProp>> = Vec::new();
+                        fbx_collect_p_props(c.d, c.ver, children_at, node_end, &mut p_props);
+                        let local = fbx_model_local(&p_props);
+                        scan.models.push(FbxModel {
+                            id,
+                            local,
+                            parent: -1,
+                        });
+                    }
                     let is_geom_node = name == "Geometry";
                     if is_geom_node {
                         // 嵌套 Geometry（少见）：先把上一层的数据结算掉
-                        fbx_flush(cur, out);
-                        *cur = FbxGeom::default();
+                        scan.flush();
+                        scan.cur = FbxGeom::default();
+                        scan.cur.id = props
+                            .iter()
+                            .find_map(|p| match p {
+                                FbxProp::I64Scalar(v) => Some(*v),
+                                _ => None,
+                            })
+                            .unwrap_or(-1);
                     }
                     if is_geom_node || inside_geometry {
-                        fbx_props_take(&name, &props, cur);
+                        fbx_props_take(&name, &props, &mut scan.cur);
+                        // 法线层：Geometry 下的 LayerElementNormal 子树
+                        if name == "LayerElementNormal" && scan.cur.normals.is_none() {
+                            let mut kids: Vec<(String, Vec<FbxProp>, usize, usize)> = Vec::new();
+                            fbx_read_children(c.d, c.ver, children_at, node_end, &mut kids);
+                            let flat: Vec<(String, Vec<FbxProp>)> = kids
+                                .into_iter()
+                                .map(|(n, p, _, _)| (n, p))
+                                .collect();
+                            scan.cur.normals = fbx_normals_from(&flat);
+                        }
                     }
                     let mut ch = FbxCur {
                         d: c.d,
                         p: children_at,
                         ver: c.ver,
                     };
-                    scan(
+                    walk(
                         &mut ch,
                         node_end,
                         depth + 1,
                         is_geom_node || inside_geometry,
-                        cur,
-                        out,
+                        scan,
                     );
                     if is_geom_node {
-                        fbx_flush(cur, out);
+                        scan.flush();
                     }
                     c.p = node_end;
                 }
@@ -2598,13 +3081,113 @@ fn load_fbx_binary(data: &[u8]) -> anyhow::Result<Mesh> {
         }
     }
 
-    scan(&mut c, data.len(), 0, false, &mut cur, &mut out);
-    fbx_flush(&mut cur, &mut out);
+    walk(&mut c, data.len(), 0, false, &mut scan);
+    scan.flush();
 
-    if out.0.len() < 3 || out.1.len() < 3 {
+    // ── Connections：解析 OO 记录，拿 Geometry→Model 与 Model→Model 的父子关系 ──
+    let mut geom_to_model: Vec<(i64, i64)> = Vec::new();
+    {
+        let mut cc = FbxCur {
+            d: data,
+            p: start,
+            ver,
+        };
+        // 递归找顶层 Connections 节点
+        fn find_conn(c: &mut FbxCur, end: usize, depth: u32) -> Option<(usize, usize)> {
+            if depth > 8 {
+                return None;
+            }
+            while c.p + c.off_size() <= end {
+                let sz = c.off_size();
+                let Some(node_end) = c.off() else { return None };
+                c.p -= sz;
+                if node_end == 0 {
+                    return None;
+                }
+                if node_end <= c.p || node_end > end {
+                    c.p += sz;
+                    continue;
+                }
+                match fbx_read_node(c, node_end) {
+                    Some((name, props, children_at)) => {
+                        if name == "Connections" {
+                            return Some((children_at, node_end));
+                        }
+                        let _ = props;
+                        let mut ch = FbxCur {
+                            d: c.d,
+                            p: children_at,
+                            ver: c.ver,
+                        };
+                        if let Some(r) = find_conn(&mut ch, node_end, depth + 1) {
+                            return Some(r);
+                        }
+                        c.p = node_end;
+                    }
+                    None => c.p = node_end,
+                }
+            }
+            None
+        }
+        if let Some((cs, ce)) = find_conn(&mut cc, data.len(), 0) {
+            let mut kids: Vec<(String, Vec<FbxProp>, usize, usize)> = Vec::new();
+            fbx_read_children(data, ver, cs, ce, &mut kids);
+            for (name, props, _, _) in &kids {
+                if name != "C" {
+                    continue;
+                }
+                // C: "OO", childId, parentId
+                if !matches!(props.first(), Some(FbxProp::Str(k)) if k == "OO") {
+                    continue;
+                }
+                let ids: Vec<i64> = props
+                    .iter()
+                    .filter_map(|p| match p {
+                        FbxProp::I64Scalar(v) => Some(*v),
+                        _ => None,
+                    })
+                    .collect();
+                if ids.len() < 2 {
+                    continue;
+                }
+                let (child, parent) = (ids[0], ids[1]);
+                if scan.geoms.iter().any(|g| g.id == child) {
+                    geom_to_model.push((child, parent));
+                } else if scan.models.iter().any(|m| m.id == child)
+                    && scan.models.iter().any(|m| m.id == parent)
+                    && let Some(m) = scan.models.iter_mut().find(|m| m.id == child)
+                {
+                    m.parent = parent;
+                }
+            }
+        }
+    }
+
+    // ── 结算：应用世界矩阵，展开成带法线的网格 ──
+    let mut out_pos: Vec<[f32; 3]> = Vec::new();
+    let mut out_idx: Vec<u32> = Vec::new();
+    let mut out_nrm: Vec<[f32; 3]> = Vec::new();
+    for g in std::mem::take(&mut scan.geoms) {
+        let world = geom_to_model
+            .iter()
+            .find(|(cg, _)| *cg == g.id)
+            .map(|(_, m)| fbx_model_world(&scan.models, *m))
+            .unwrap_or(Mat4::IDENTITY);
+        fbx_emit_geom(g, world, &mut out_pos, &mut out_idx, &mut out_nrm);
+    }
+
+    if out_pos.len() < 3 || out_idx.len() < 3 {
         anyhow::bail!("二进制 FBX 未找到多边形网格（可能只含曲线/点），请导出为 OBJ/GLB/STL");
     }
-    Ok(Mesh::from_positions_indices(out.0, out.1, None))
+    let mut mesh = Mesh {
+        positions: out_pos,
+        normals: out_nrm,
+        colors: None,
+        indices: out_idx,
+        ..Default::default()
+    };
+    mesh.ensure_normals();
+    Ok(mesh)
 }
 
 fn load_pmx(path: &Path) -> anyhow::Result<Mesh> {
@@ -3195,6 +3778,140 @@ mod tests {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
             .join(name)
+    }
+
+    /// 贴图文件缺失的 glTF 仍应加载出几何，并报告缺失数量。
+    /// 对应真实场景：Blender 导出的 .gltf 把 textures/ 目录弄丢了。
+    #[test]
+    fn gltf_missing_texture_still_loads() {
+        // 单个三角形的 glTF：buffer 用 data URI（保证几何可用），
+        // image 指向一个不存在的文件（模拟 textures/ 丢失）
+        let positions: [[f32; 3]; 3] = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let mut bin: Vec<u8> = Vec::new();
+        for p in &positions {
+            for c in p {
+                bin.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+        for _ in 0..3 {
+            bin.extend_from_slice(&0.0f32.to_le_bytes());
+            bin.extend_from_slice(&0.0f32.to_le_bytes());
+            bin.extend_from_slice(&1.0f32.to_le_bytes());
+        }
+        for _ in 0..3 {
+            bin.extend_from_slice(&0.5f32.to_le_bytes());
+            bin.extend_from_slice(&0.5f32.to_le_bytes());
+        }
+        let gltf_json = format!(
+            r#"{{
+  "asset": {{ "version": "2.0" }},
+  "buffers": [{{ "uri": "data:application/octet-stream;base64,{}", "byteLength": {} }}],
+  "bufferViews": [
+    {{ "buffer": 0, "byteOffset": 0,  "byteLength": 36, "target": 34962 }},
+    {{ "buffer": 0, "byteOffset": 36, "byteLength": 36, "target": 34962 }},
+    {{ "buffer": 0, "byteOffset": 72, "byteLength": 24, "target": 34962 }}
+  ],
+  "accessors": [
+    {{ "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "max": [1,1,0], "min": [0,0,0] }},
+    {{ "bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC3" }},
+    {{ "bufferView": 2, "componentType": 5126, "count": 3, "type": "VEC2" }}
+  ],
+  "images": [{{ "uri": "textures/does_not_exist.png" }}],
+  "samplers": [],
+  "textures": [{{ "source": 0 }}],
+  "materials": [{{ "pbrMetallicRoughness": {{ "baseColorTexture": {{ "index": 0 }} }} }}],
+  "meshes": [{{ "primitives": [{{ "attributes": {{ "POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2 }}, "indices": null, "material": 0, "mode": 4 }}] }}],
+  "nodes": [{{ "mesh": 0 }}],
+  "scenes": [{{ "nodes": [0] }}],
+  "scene": 0
+}}"#,
+            base64_encode(&bin),
+            bin.len()
+        );
+        let dir = std::env::temp_dir().join(format!("dadaview_gltf_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("missing_tex.gltf");
+        std::fs::write(&path, gltf_json.as_bytes()).unwrap();
+
+        let (mesh, missing) = load_gltf(&path).expect("贴图缺失不应阻止加载");
+        assert_eq!(mesh.positions.len(), 3, "三角形顶点应完整加载");
+        assert_eq!(missing, 1, "应报告 1 张缺失贴图");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn base64_encode(data: &[u8]) -> String {
+        const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in data.chunks(3) {
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
+            out.push(T[(b[0] >> 2) as usize] as char);
+            out.push(T[(((b[0] & 0x03) << 4) | (b[1] >> 4)) as usize] as char);
+            out.push(if chunk.len() > 1 {
+                T[(((b[1] & 0x0f) << 2) | (b[2] >> 6)) as usize] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                T[(b[2] & 0x3f) as usize] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    /// 合成 FBX：三角形 + Model 的 Lcl 变换（平移(10,0,0)·绕Z 90°·缩放2倍）。
+    /// 顶点应被变换到 (10,0,0) (10,2,0) (8,0,0)，法线保持 (0,0,1)。
+    /// 覆盖：P 记录 TRS 解析、Connections OO、世界矩阵、法线矩阵、逐角展开。
+    #[test]
+    fn fbx_model_transform_and_normals() {
+        let m = Model3D::load_path(&sample_path("transform_test.fbx")).expect("合成 FBX 应能加载");
+        let mesh = &m.mesh;
+        assert_eq!(mesh.positions.len(), 3, "三角形应展开成 3 个角顶点");
+        assert_eq!(mesh.normals.len(), 3, "FBX 法线应被采用");
+        let expect = [
+            [10.0f32, 0.0, 0.0],
+            [10.0, 2.0, 0.0],
+            [8.0, 0.0, 0.0],
+        ];
+        for (got, want) in mesh.positions.iter().zip(expect.iter()) {
+            for k in 0..3 {
+                assert!(
+                    (got[k] - want[k]).abs() < 1e-4,
+                    "顶点变换错误: got {:?}, want {:?}",
+                    got,
+                    want
+                );
+            }
+        }
+        for n in &mesh.normals {
+            assert!((n[0]).abs() < 1e-4 && (n[1]).abs() < 1e-4 && (n[2] - 1.0).abs() < 1e-4,
+                "法线应保持 (0,0,1)，得到 {:?}", n);
+        }
+        assert_eq!(mesh.indices, vec![0, 1, 2]);
+    }
+
+    /// 两级 Model 层级：父(100,0,0) + 子(5,0,0)，几何挂子节点。
+    /// 世界矩阵应累加，顶点 (0,0,0) 应落到 (105,0,0)。
+    #[test]
+    fn fbx_nested_model_transforms() {
+        let m = Model3D::load_path(&sample_path("transform_nested_test.fbx")).expect("嵌套 FBX 应能加载");
+        let mesh = &m.mesh;
+        assert_eq!(mesh.positions.len(), 3);
+        // 三角形三点 (0,0,0) (1,0,0) (0,1,0) 平移 (105,0,0) 后：
+        let expect = [[105.0f32, 0.0, 0.0], [106.0, 0.0, 0.0], [105.0, 1.0, 0.0]];
+        for (got, want) in mesh.positions.iter().zip(expect.iter()) {
+            for k in 0..3 {
+                assert!((got[k] - want[k]).abs() < 1e-4,
+                    "嵌套变换应累加，得到 {:?}，期望 {:?}", got, want);
+            }
+        }
     }
 
     #[test]

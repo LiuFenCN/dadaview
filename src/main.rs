@@ -159,6 +159,8 @@ struct DaDaViewApp {
 
     file_assoc_check: BTreeMap<String, bool>, // 文件关联复选框状态
 
+    file_assoc_msg: Option<String>, // 文件关联操作结果反馈（设置面板内显示）
+
     deferred_resize_time: Option<f64>, // 翻页后延迟 resize 的时间戳
 
     // GIF 动画支持
@@ -186,6 +188,8 @@ struct DaDaViewApp {
     model_pending: Arc<Mutex<Option<Result<mesh3d::Model3D, String>>>>,
     viewing_3d: bool,
     model_error: Option<String>,
+    /// 模型加载成功但有不影响显示的降级（如贴图缺失）
+    model_warning: Option<String>,
     middle_down: bool,
     middle_moved: bool,
     // 异步渲染
@@ -277,6 +281,8 @@ impl Default for DaDaViewApp {
 
             file_assoc_check,
 
+            file_assoc_msg: None,
+
             deferred_resize_time: None,
 
             anim_frames: Vec::new(),
@@ -301,6 +307,7 @@ impl Default for DaDaViewApp {
             model_pending: Arc::new(Mutex::new(None)),
             viewing_3d: false,
             model_error: None,
+            model_warning: None,
             middle_down: false,
             middle_moved: false,
             model_render_out: Arc::new(Mutex::new(None)),
@@ -490,6 +497,8 @@ impl DaDaViewApp {
 
         self.model_error = None;
 
+        self.model_warning = None;
+
         *self.model_pending.lock().unwrap() = None;
 
         *self.pending_error.lock().unwrap() = None;
@@ -546,6 +555,8 @@ impl DaDaViewApp {
         self.model = None;
 
         self.model_error = None;
+
+        self.model_warning = None;
 
         self.current_texture = None;
 
@@ -813,6 +824,16 @@ impl DaDaViewApp {
                 Ok(model) => {
                     self.model_error = None;
 
+                    // glTF 外部贴图缺失：能打开但不完整，给个黄色提示
+                    self.model_warning = if model.missing_textures > 0 {
+                        Some(format!(
+                            "{} 张贴图文件缺失，模型以无贴图模式显示",
+                            model.missing_textures
+                        ))
+                    } else {
+                        None
+                    };
+
                     self.model = Some(model);
 
                     // 先快速出一帧，再补高清
@@ -826,6 +847,8 @@ impl DaDaViewApp {
                     self.model = None;
 
                     self.model_error = Some(e);
+
+                    self.model_warning = None;
 
                     self.viewing_3d = false;
 
@@ -1408,6 +1431,8 @@ impl DaDaViewApp {
 
         self.model_error = None;
 
+        self.model_warning = None;
+
         *self.model_pending.lock().unwrap() = None;
 
         // 清除动画状态，否则动画循环会覆盖新图片纹理
@@ -1546,6 +1571,8 @@ impl DaDaViewApp {
         self.model = None;
 
         self.model_error = None;
+
+        self.model_warning = None;
 
         *self.model_pending.lock().unwrap() = None;
 
@@ -2058,6 +2085,8 @@ impl DaDaViewApp {
                         self.show_settings = false;
 
                         self.rebinding = None;
+
+                        self.file_assoc_msg = None;
                     }
                 });
             });
@@ -2495,14 +2524,22 @@ impl DaDaViewApp {
                                 .map(|(k, _)| k.clone())
                                 .collect();
 
-                            match register_file_association(&selected, false) {
-                                Ok(()) => {
-                                    self.settings.associated_exts = selected;
+                            if selected.is_empty() {
+                                self.file_assoc_msg = Some("请先勾选要关联的格式".into());
+                            } else {
+                                // 勾选状态即用户意图，无论注册结果如何都保存
+                                self.settings.associated_exts = selected.clone();
+                                self.settings.save();
 
-                                    self.settings.save();
-                                }
-
-                                Err(e) => eprintln!("注册文件关联失败: {}", e),
+                                self.file_assoc_msg = Some(
+                                    match register_file_association(&selected, false) {
+                                        Ok(()) => format!(
+                                            "已注册 {} 个格式到\"打开方式\"列表（未改默认打开方式，如需请点\"设为默认查看器\"）",
+                                            selected.len()
+                                        ),
+                                        Err(e) => format!("注册失败: {}", e),
+                                    },
+                                );
                             }
                         }
 
@@ -2520,14 +2557,20 @@ impl DaDaViewApp {
                                 .map(|(k, _)| k.clone())
                                 .collect();
 
-                            match register_file_association(&selected, true) {
-                                Ok(()) => {
-                                    self.settings.associated_exts = selected;
+                            if selected.is_empty() {
+                                self.file_assoc_msg = Some("请先勾选要关联的格式".into());
+                            } else {
+                                self.settings.associated_exts = selected.clone();
+                                self.settings.save();
 
-                                    self.settings.save();
-                                }
-
-                                Err(e) => eprintln!("设为默认查看器失败: {}", e),
+                                self.file_assoc_msg =
+                                    Some(match register_file_association(&selected, true) {
+                                        Ok(()) => format!(
+                                            "已将 {} 个格式的默认打开方式设为 DaDaView",
+                                            selected.len()
+                                        ),
+                                        Err(e) => format!("设置默认查看器失败: {}", e),
+                                    });
                             }
                         }
 
@@ -2547,6 +2590,24 @@ impl DaDaViewApp {
                         }
                     });
 
+                    // 关联操作结果反馈
+
+                    if let Some(msg) = &self.file_assoc_msg {
+                        ui.add_space(6.0);
+
+                        ui.horizontal(|ui| {
+                            ui.add_space(8.0);
+
+                            let color = if msg.starts_with('已') {
+                                Color32::from_rgb(130, 220, 150)
+                            } else {
+                                Color32::from_rgb(255, 140, 140)
+                            };
+
+                            ui.label(RichText::new(msg).size(12.0).color(color));
+                        });
+                    }
+
                     ui.add_space(10.0);
                 });
         });
@@ -2562,6 +2623,8 @@ impl DaDaViewApp {
                 self.show_settings = false;
 
                 self.rebinding = None;
+
+                self.file_assoc_msg = None;
             }
         }
     }
@@ -3094,6 +3157,16 @@ impl eframe::App for DaDaViewApp {
                             ui.label(
                                 RichText::new(format!("模型加载失败：{}", err))
                                     .color(Color32::from_rgb(220, 120, 120))
+                                    .size(12.0),
+                            );
+                        }
+
+                        if let Some(warn) = &self.model_warning {
+                            ui.add_space(12.0);
+
+                            ui.label(
+                                RichText::new(format!("提示：{}", warn))
+                                    .color(Color32::from_rgb(210, 170, 80))
                                     .size(12.0),
                             );
                         }

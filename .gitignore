@@ -6,3 +6,8 @@
 /installer/obj
 /installer/launcher/target
 *.exe
+
+# WorkBuddy agent workspace
+/.workbuddy
+/.scratch2
+/.wix
