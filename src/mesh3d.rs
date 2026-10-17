@@ -34,12 +34,93 @@ const MAX_RENDER_TRIS_HQ: usize = 2_000_000;
 const MAX_RENDER_TRIS_FAST: usize = 2_000_000;
 const SKIP_VERTEX_NORMALS_ABOVE: usize = 400_000;
 
-#[derive(Clone)]
+/// 8 位 sRGB 纹理。像素按解码顺序存放（第 0 行是图像顶部），
+/// 这样软件光栅化与 wgpu 用同一份数据、同一个 UV 约定
+#[derive(Clone, Default)]
+pub struct Texture {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: std::sync::Arc<Vec<u8>>,
+}
+
+impl Texture {
+    #[inline]
+    fn texel(&self, x: usize, y: usize) -> [f32; 4] {
+        let o = (y * self.width as usize + x) * 4;
+        match self.rgba.get(o..o + 4) {
+            Some(p) => [
+                p[0] as f32 / 255.0,
+                p[1] as f32 / 255.0,
+                p[2] as f32 / 255.0,
+                p[3] as f32 / 255.0,
+            ],
+            None => [1.0, 1.0, 1.0, 1.0],
+        }
+    }
+}
+
+/// 该顶点不使用贴图（走顶点色/纯色）
+pub const NO_TEXTURE: u32 = u32::MAX;
+
+#[derive(Clone, Default)]
 pub struct Mesh {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
     pub colors: Option<Vec<[f32; 3]>>,
     pub indices: Vec<u32>,
+    /// 逐顶点 UV，长度与 positions 一致
+    pub uvs: Option<Vec<[f32; 2]>>,
+    /// 逐顶点使用的纹理下标（指向 textures），与 uvs 同步存在
+    pub tex_ids: Option<Vec<u32>>,
+    pub textures: Vec<std::sync::Arc<Texture>>,
+}
+
+#[inline]
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+#[inline]
+pub(crate) fn linear_to_srgb(c: f32) -> f32 {
+    let c = c.clamp(0.0, 1.0);
+    if c <= 0.0031308 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// 双线性 + clamp 采样，返回线性 RGB 与 alpha
+fn sample_texture(tex: &Texture, u: f32, v: f32) -> ([f32; 3], f32) {
+    let tw = tex.width.max(1) as i32;
+    let th = tex.height.max(1) as i32;
+    let fx = u * tw as f32 - 0.5;
+    let fy = v * th as f32 - 0.5;
+    let x0 = fx.floor() as i32;
+    let y0 = fy.floor() as i32;
+    let tx = fx - x0 as f32;
+    let ty = fy - y0 as f32;
+    let grab =
+        |xi: i32, yi: i32| tex.texel(xi.clamp(0, tw - 1) as usize, yi.clamp(0, th - 1) as usize);
+    let a = grab(x0, y0);
+    let b = grab(x0 + 1, y0);
+    let c = grab(x0, y0 + 1);
+    let d = grab(x0 + 1, y0 + 1);
+    let top = |i: usize| a[i] + (b[i] - a[i]) * tx;
+    let bot = |i: usize| c[i] + (d[i] - c[i]) * tx;
+    let mix = |i: usize| top(i) + (bot(i) - top(i)) * ty;
+    (
+        [
+            srgb_to_linear(mix(0).clamp(0.0, 1.0)),
+            srgb_to_linear(mix(1).clamp(0.0, 1.0)),
+            srgb_to_linear(mix(2).clamp(0.0, 1.0)),
+        ],
+        mix(3).clamp(0.0, 1.0),
+    )
 }
 
 impl Mesh {
@@ -49,6 +130,54 @@ impl Mesh {
 
     pub fn vertex_count(&self) -> usize {
         self.positions.len()
+    }
+
+    /// 贴图通道是否可用（三者长度与顶点数一致才算）
+    pub(crate) fn texture_channels(&self) -> Option<(&Vec<[f32; 2]>, &Vec<u32>)> {
+        let uvs = self.uvs.as_ref()?;
+        let ids = self.tex_ids.as_ref()?;
+        if self.textures.is_empty()
+            || uvs.len() != self.positions.len()
+            || ids.len() != self.positions.len()
+        {
+            return None;
+        }
+        Some((uvs, ids))
+    }
+
+    /// 该三角形用哪张贴图 + 三个顶点的 UV。软件光栅化与 GPU 都用它，画面才一致
+    pub(crate) fn tri_textured(
+        &self,
+        i0: usize,
+        i1: usize,
+        i2: usize,
+    ) -> Option<(usize, [[f32; 2]; 3])> {
+        let (uvs, ids) = self.texture_channels()?;
+        let t = *ids.get(i0)?;
+        if t == NO_TEXTURE || ids.get(i1).copied() != Some(t) || ids.get(i2).copied() != Some(t) {
+            return None;
+        }
+        if t as usize >= self.textures.len() {
+            return None;
+        }
+        let uv = [*uvs.get(i0)?, *uvs.get(i1)?, *uvs.get(i2)?];
+        Some((t as usize, uv))
+    }
+
+    /// 该顶点是否绑定了一张有效贴图（GPU 用它在缺顶点色时选白，与软件光栅化一致）
+    pub(crate) fn vertex_textured(&self, i: usize) -> bool {
+        let Some((_, ids)) = self.texture_channels() else {
+            return false;
+        };
+        match ids.get(i).copied() {
+            Some(t) if t != NO_TEXTURE => (t as usize) < self.textures.len(),
+            _ => false,
+        }
+    }
+
+    /// 该三角形用的贴图下标
+    pub(crate) fn tri_texture(&self, i0: usize, i1: usize, i2: usize) -> Option<usize> {
+        self.tri_textured(i0, i1, i2).map(|(t, _)| t)
     }
 
     fn bounds(&self) -> (Vec3, Vec3) {
@@ -110,6 +239,7 @@ impl Mesh {
 
     fn append_mesh(&mut self, other: Mesh, xform: Mat4) {
         let base = self.positions.len() as u32;
+        let old_len = base as usize;
         let normal_mat = xform.inverse().transpose();
         for p in &other.positions {
             let v = xform.transform_point3(Vec3::from(*p));
@@ -146,6 +276,49 @@ impl Mesh {
         for i in &other.indices {
             self.indices.push(base + i);
         }
+        // 贴图：先并纹理表（Arc 指针相同即同一张，避免同一图重复上传），再接 UV 与逐顶点纹理号
+        let mut remap: Vec<u32> = Vec::new();
+        for t in &other.textures {
+            let reuse = self
+                .textures
+                .iter()
+                .position(|cur| std::sync::Arc::ptr_eq(cur, t));
+            remap.push(match reuse {
+                Some(j) => j as u32,
+                None => {
+                    self.textures.push(t.clone());
+                    (self.textures.len() - 1) as u32
+                }
+            });
+        }
+        let other_tex = !other.textures.is_empty();
+        if other_tex || !self.textures.is_empty() {
+            let mut uvs = self.uvs.take().unwrap_or_else(|| vec![[0.0; 2]; old_len]);
+            uvs.resize(self.positions.len(), [0.0; 2]);
+            if let Some(src) = &other.uvs {
+                for (k, uv) in src.iter().enumerate().take(other.positions.len()) {
+                    uvs[old_len + k] = *uv;
+                }
+            }
+            self.uvs = Some(uvs);
+
+            let mut ids = self
+                .tex_ids
+                .take()
+                .unwrap_or_else(|| vec![NO_TEXTURE; old_len]);
+            ids.resize(self.positions.len(), NO_TEXTURE);
+            if let Some(src) = &other.tex_ids {
+                for (k, id) in src.iter().enumerate().take(other.positions.len()) {
+                    let mapped = if other_tex {
+                        remap.get(*id as usize).copied().unwrap_or(NO_TEXTURE)
+                    } else {
+                        NO_TEXTURE
+                    };
+                    ids[old_len + k] = mapped;
+                }
+            }
+            self.tex_ids = Some(ids);
+        }
     }
 
     fn from_positions_indices(
@@ -158,6 +331,7 @@ impl Mesh {
             normals: Vec::new(),
             colors,
             indices,
+            ..Default::default()
         };
         m.ensure_normals();
         m
@@ -357,12 +531,7 @@ fn load_obj(path: &Path) -> anyhow::Result<Mesh> {
         },
     )?;
     let materials = materials.unwrap_or_default();
-    let mut out = Mesh {
-        positions: Vec::new(),
-        normals: Vec::new(),
-        colors: None,
-        indices: Vec::new(),
-    };
+    let mut out = Mesh::default();
     for model in models {
         let mesh = model.mesh;
         if mesh.positions.is_empty() || mesh.indices.is_empty() {
@@ -397,6 +566,7 @@ fn load_obj(path: &Path) -> anyhow::Result<Mesh> {
             normals,
             colors,
             indices: mesh.indices,
+            ..Default::default()
         };
         piece.ensure_normals();
         out.append_mesh(piece, Mat4::IDENTITY);
@@ -518,19 +688,72 @@ fn parse_ascii_stl(data: &[u8]) -> anyhow::Result<(Vec<[f32; 3]>, Vec<u32>)> {
     Ok((positions, indices))
 }
 
+/// 贴图尺寸上限：超过就只画几何，避免一张 8K 图把内存吃掉
+pub(crate) const MAX_TEXTURE_DIM: u32 = 8192;
+const MAX_TEXTURE_PIXELS: usize = 4096 * 4096;
+
+/// gltf::import 已把内嵌图片解码成 8 位像素；这里统一成 RGBA8。
+/// 少见格式（单通道、高位深）直接放弃贴图而不是猜颜色
+fn decode_texture(data: &gltf::image::Data) -> Option<Texture> {
+    use gltf::image::Format;
+    let (w, h) = (data.width, data.height);
+    if w == 0
+        || h == 0
+        || w > MAX_TEXTURE_DIM
+        || h > MAX_TEXTURE_DIM
+        || (w as usize) * (h as usize) > MAX_TEXTURE_PIXELS
+    {
+        return None;
+    }
+    let n = (w as usize) * (h as usize);
+    let mut rgba = vec![0u8; n * 4];
+    match data.format {
+        Format::R8G8B8A8 => {
+            if data.pixels.len() < n * 4 {
+                return None;
+            }
+            rgba.copy_from_slice(&data.pixels[..n * 4]);
+        }
+        Format::R8G8B8 => {
+            if data.pixels.len() < n * 3 {
+                return None;
+            }
+            for i in 0..n {
+                let s = &data.pixels[i * 3..i * 3 + 3];
+                rgba[i * 4..i * 4 + 4].copy_from_slice(&[s[0], s[1], s[2], 255]);
+            }
+        }
+        _ => return None,
+    }
+    Some(Texture {
+        width: w,
+        height: h,
+        rgba: std::sync::Arc::new(rgba),
+    })
+}
+
+/// 线性纹素 × 底色 × 光照 → 显示色（与 wgpu 里的算法一致）
+#[inline]
+fn texel_color(lin: [f32; 3], mul: [f32; 3], shade: f32) -> Color32 {
+    Color32::from_rgb(
+        (linear_to_srgb(lin[0] * mul[0] * shade) * 255.0).clamp(0.0, 255.0) as u8,
+        (linear_to_srgb(lin[1] * mul[1] * shade) * 255.0).clamp(0.0, 255.0) as u8,
+        (linear_to_srgb(lin[2] * mul[2] * shade) * 255.0).clamp(0.0, 255.0) as u8,
+    )
+}
+
 fn load_gltf(path: &Path) -> anyhow::Result<Mesh> {
-    let (document, buffers, _images) = gltf::import(path)?;
-    let mut out = Mesh {
-        positions: Vec::new(),
-        normals: Vec::new(),
-        colors: None,
-        indices: Vec::new(),
-    };
+    let (document, buffers, images) = gltf::import(path)?;
+    // 同一张图被多个材质引用时只解码一次（Arc 共享，append_mesh 靠指针去重）
+    let mut tex_cache: Vec<Option<std::sync::Arc<Texture>>> = vec![None; document.images().len()];
+    let mut out = Mesh::default();
 
     fn read_node(
         node: &gltf::Node,
         parent: Mat4,
         buffers: &[gltf::buffer::Data],
+        images: &[gltf::image::Data],
+        tex_cache: &mut [Option<std::sync::Arc<Texture>>],
         out: &mut Mesh,
     ) -> anyhow::Result<()> {
         let local = Mat4::from_cols_array_2d(&node.transform().matrix());
@@ -546,8 +769,56 @@ fn load_gltf(path: &Path) -> anyhow::Result<Mesh> {
                     .read_normals()
                     .map(|i| i.collect())
                     .unwrap_or_default();
-                let colors: Option<Vec<[f32; 3]>> =
+                let material = primitive.material();
+                let pbr = material.pbr_metallic_roughness();
+                // baseColorFactor 是线性值，转成显示色存进顶点色，两条光栅化路径都用它
+                let factor = pbr.base_color_factor();
+                let factor_col = if factor[0] < 0.999
+                    || factor[1] < 0.999
+                    || factor[2] < 0.999
+                    || material.alpha_mode() != gltf::material::AlphaMode::Opaque
+                {
+                    Some([
+                        linear_to_srgb(factor[0]),
+                        linear_to_srgb(factor[1]),
+                        linear_to_srgb(factor[2]),
+                    ])
+                } else {
+                    None
+                };
+                let mut colors: Option<Vec<[f32; 3]>> =
                     reader.read_colors(0).map(|c| c.into_rgb_f32().collect());
+                if colors.is_none()
+                    && let Some(c) = factor_col
+                {
+                    colors = Some(vec![c; positions.len()]);
+                }
+                // 只认 baseColorTexture： MetallicRoughness/Normal/Occlusion/Emissive 暂不接
+                let mut tex: Option<std::sync::Arc<Texture>> = None;
+                let mut uvs: Option<Vec<[f32; 2]>> = None;
+                if let Some(info) = pbr.base_color_texture() {
+                    let img = info.texture().source().index();
+                    if let Some(slot) = tex_cache.get_mut(img) {
+                        if slot.is_none() {
+                            *slot = images
+                                .get(img)
+                                .and_then(decode_texture)
+                                .map(std::sync::Arc::new);
+                        }
+                        tex = slot.clone();
+                    }
+                    if let Some(t) = &tex {
+                        let set = info.tex_coord();
+                        let read = reader
+                            .read_tex_coords(set)
+                            .map(|c| c.into_f32().collect::<Vec<[f32; 2]>>());
+                        // 有贴图却没 UV 集时，用全 1 色当贴图会糊成一团，直接退回顶点色
+                        match read {
+                            Some(u) if u.len() == positions.len() && t.width > 0 => uvs = Some(u),
+                            _ => tex = None,
+                        }
+                    }
+                }
                 let indices: Vec<u32> = match reader.read_indices() {
                     Some(i) => i.into_u32().collect(),
                     None => (0..positions.len() as u32).collect(),
@@ -555,30 +826,50 @@ fn load_gltf(path: &Path) -> anyhow::Result<Mesh> {
                 if !matches!(primitive.mode(), gltf::mesh::Mode::Triangles) {
                     continue;
                 }
+                let has_tex = tex.is_some();
+                let textures: Vec<std::sync::Arc<Texture>> = tex.into_iter().collect();
+                let tex_ids = has_tex.then(|| vec![0u32; positions.len()]);
                 let mut piece = Mesh {
                     positions,
                     normals,
                     colors,
                     indices,
+                    uvs,
+                    tex_ids,
+                    textures,
                 };
                 piece.ensure_normals();
                 out.append_mesh(piece, world);
             }
         }
         for child in node.children() {
-            read_node(&child, world, buffers, out)?;
+            read_node(&child, world, buffers, images, tex_cache, out)?;
         }
         Ok(())
     }
 
     for scene in document.scenes() {
         for node in scene.nodes() {
-            read_node(&node, Mat4::IDENTITY, &buffers, &mut out)?;
+            read_node(
+                &node,
+                Mat4::IDENTITY,
+                &buffers,
+                &images,
+                &mut tex_cache,
+                &mut out,
+            )?;
         }
     }
     if out.positions.is_empty() {
         for node in document.nodes() {
-            read_node(&node, Mat4::IDENTITY, &buffers, &mut out)?;
+            read_node(
+                &node,
+                Mat4::IDENTITY,
+                &buffers,
+                &images,
+                &mut tex_cache,
+                &mut out,
+            )?;
         }
     }
     if out.positions.is_empty() {
@@ -864,12 +1155,7 @@ fn load_off(path: &Path) -> anyhow::Result<Mesh> {
 
 fn load_3ds(path: &Path) -> anyhow::Result<Mesh> {
     let data = std::fs::read(path)?;
-    let mut out = Mesh {
-        positions: Vec::new(),
-        normals: Vec::new(),
-        colors: None,
-        indices: Vec::new(),
-    };
+    let mut out = Mesh::default();
     walk_3ds(&data, &mut out)?;
     if out.positions.is_empty() || out.indices.is_empty() {
         anyhow::bail!("3DS 中没有有效网格");
@@ -1078,12 +1364,7 @@ fn extract_float_array(block: &str) -> Option<Vec<f32>> {
 fn load_dae(path: &Path) -> anyhow::Result<Mesh> {
     let text = std::fs::read_to_string(path)?;
     let lower = text.to_ascii_lowercase();
-    let mut out = Mesh {
-        positions: Vec::new(),
-        normals: Vec::new(),
-        colors: None,
-        indices: Vec::new(),
-    };
+    let mut out = Mesh::default();
     let mut search_from = 0usize;
     let mut found = false;
     while let Some(mesh_start) = find_tag(&lower, "mesh", search_from) {
@@ -1452,12 +1733,7 @@ fn load_3mf(path: &Path) -> anyhow::Result<Mesh> {
     if names.is_empty() {
         anyhow::bail!("3MF 中未找到 .model 文件");
     }
-    let mut out = Mesh {
-        positions: Vec::new(),
-        normals: Vec::new(),
-        colors: None,
-        indices: Vec::new(),
-    };
+    let mut out = Mesh::default();
     let mut any = false;
     for name in &names {
         let mut s = String::new();
@@ -1626,6 +1902,7 @@ fn parse_3mf_mesh_block(mb: &str, mbl: &str) -> Option<Mesh> {
         normals: Vec::new(),
         colors: None,
         indices,
+        ..Default::default()
     })
 }
 
@@ -2756,12 +3033,17 @@ pub fn render_mesh_ex(
         let (fnx, fny, fnz) = (fnx / fl, fny / fl, fnz / fl);
         let area2 = edge(s0, s1, s2);
 
+        let tex_tri = mesh.tri_textured(i0, i1, i2);
+        let tex_img = tex_tri.as_ref().map(|(t, _)| &*mesh.textures[*t]);
+
+        // 贴图三角形的底色：有顶点色（含 baseColorFactor）用它，否则纯白别压暗贴图
         let (cr0, cg0, cb0) = match &mesh.colors {
             Some(cols) if i0 < cols.len() && i1 < cols.len() && i2 < cols.len() => (
                 (cols[i0][0] + cols[i1][0] + cols[i2][0]) / 3.0,
                 (cols[i0][1] + cols[i1][1] + cols[i2][1]) / 3.0,
                 (cols[i0][2] + cols[i1][2] + cols[i2][2]) / 3.0,
             ),
+            _ if tex_img.is_some() => (1.0, 1.0, 1.0),
             _ => (default_col[0], default_col[1], default_col[2]),
         };
 
@@ -2790,11 +3072,34 @@ pub fn render_mesh_ex(
             shade += ((nx * hx + ny * hy + nz * hz) / hl).abs().powf(16.0) * 0.12;
         }
         shade = shade.clamp(0.0, 1.5);
-        let packed = Color32::from_rgb(
-            (cr0 * shade * 255.0).min(255.0) as u8,
-            (cg0 * shade * 255.0).min(255.0) as u8,
-            (cb0 * shade * 255.0).min(255.0) as u8,
-        );
+        // 底色乘子也要在线性空间相乘，才不会把 baseColorFactor 叠暗
+        let mul_lin = if tex_img.is_some() {
+            [
+                srgb_to_linear(cr0),
+                srgb_to_linear(cg0),
+                srgb_to_linear(cb0),
+            ]
+        } else {
+            [cr0, cg0, cb0]
+        };
+        // 退化三角形只落一个中心像素：按重心（等权）采样
+        let packed = match (&tex_tri, tex_img) {
+            (Some((_, uv)), Some(tex)) => {
+                let iw = (inv0 + inv1 + inv2).max(1e-12);
+                let u = (uv[0][0] * inv0 + uv[1][0] * inv1 + uv[2][0] * inv2) / iw;
+                let v = (uv[0][1] * inv0 + uv[1][1] * inv1 + uv[2][1] * inv2) / iw;
+                let (lin, a) = sample_texture(tex, u, v);
+                if a < 0.5 {
+                    continue;
+                }
+                texel_color(lin, mul_lin, shade)
+            }
+            _ => Color32::from_rgb(
+                (cr0 * shade * 255.0).min(255.0) as u8,
+                (cg0 * shade * 255.0).min(255.0) as u8,
+                (cb0 * shade * 255.0).min(255.0) as u8,
+            ),
+        };
 
         let cx = (s0.0 + s1.0 + s2.0) / 3.0;
         let cy = (s0.1 + s1.1 + s2.1) / 3.0;
@@ -2852,8 +3157,25 @@ pub fn render_mesh_ex(
                 if z >= depth[di] {
                     continue;
                 }
+                // 贴图：透视正确的重心权重 uv = Σ(bary·uv·invW) / Σ(bary·invW)
+                let color = match (&tex_tri, tex_img) {
+                    (Some((_, uv)), Some(tex)) => {
+                        let u =
+                            (uv[0][0] * inv0 * e0 + uv[1][0] * inv1 * e1 + uv[2][0] * inv2 * e2)
+                                * z;
+                        let v =
+                            (uv[0][1] * inv0 * e0 + uv[1][1] * inv1 * e1 + uv[2][1] * inv2 * e2)
+                                * z;
+                        let (lin, a) = sample_texture(tex, u, v);
+                        if a < 0.5 {
+                            continue;
+                        }
+                        texel_color(lin, mul_lin, shade)
+                    }
+                    _ => packed,
+                };
                 depth[di] = z;
-                pixels[di] = packed;
+                pixels[di] = color;
             }
         }
     }
@@ -3211,5 +3533,338 @@ mod tests {
         assert!(is_unsupported_3d_path(std::path::Path::new("a.blend")));
         assert!(is_unsupported_3d_path(std::path::Path::new("a.step")));
         assert!(!is_model_path(std::path::Path::new("a.blend")));
+    }
+
+    /// 2x2 贴图：v=0 是图像第一行（glTF 左上原点）→ 红 | 绿 / 蓝 | 白
+    fn quad_tex() -> std::sync::Arc<Texture> {
+        std::sync::Arc::new(Texture {
+            width: 2,
+            height: 2,
+            rgba: std::sync::Arc::new(vec![
+                255, 0, 0, 255, 0, 255, 0, 255, //
+                0, 0, 255, 255, 255, 255, 255, 255, //
+            ]),
+        })
+    }
+
+    fn solid_tex(v: u8) -> std::sync::Arc<Texture> {
+        std::sync::Arc::new(Texture {
+            width: 1,
+            height: 1,
+            rgba: std::sync::Arc::new(vec![v, v, v, 255]),
+        })
+    }
+
+    #[test]
+    fn sample_texture_is_bilinear_clamped_and_linear() {
+        let tex = quad_tex();
+        let (rgb, a) = sample_texture(&tex, 0.0, 0.0);
+        assert!(
+            rgb[0] > 0.99 && rgb[1] < 0.01 && rgb[2] < 0.01 && a > 0.99,
+            "{rgb:?} {a}"
+        );
+        // 出界夹边，不环绕
+        let (rgb, _) = sample_texture(&tex, -3.0, -3.0);
+        assert!(rgb[0] > 0.99 && rgb[1] < 0.01, "{rgb:?}");
+        let (rgb, _) = sample_texture(&tex, 4.0, 0.0);
+        assert!(rgb[1] > 0.99 && rgb[0] < 0.01, "{rgb:?}");
+        // 水平中点：红绿各半（sRGB 空间插值后转线性，两边相等且明显 <1）
+        let (rgb, _) = sample_texture(&tex, 0.5, 0.0);
+        assert!(
+            (rgb[0] - rgb[1]).abs() < 1e-3 && rgb[0] > 0.15 && rgb[0] < 0.35,
+            "{rgb:?}"
+        );
+        // 第二行是蓝/白
+        let (rgb, _) = sample_texture(&tex, 0.0, 1.0);
+        assert!(rgb[2] > 0.99 && rgb[0] < 0.01, "{rgb:?}");
+    }
+
+    fn flat_tri(uvs: Vec<[f32; 2]>, ids: Vec<u32>, textures: Vec<std::sync::Arc<Texture>>) -> Mesh {
+        Mesh {
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 3],
+            colors: None,
+            indices: vec![0, 1, 2],
+            uvs: Some(uvs),
+            tex_ids: Some(ids),
+            textures,
+        }
+    }
+
+    #[test]
+    fn tri_textured_requires_one_valid_texture_per_triangle() {
+        let t = quad_tex();
+        let uv = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+        let ok = flat_tri(uv.to_vec(), vec![0, 0, 0], vec![t.clone()]);
+        assert!(ok.tri_textured(0, 1, 2).is_some());
+        assert!(ok.tri_texture(0, 1, 2) == Some(0));
+        assert!(ok.vertex_textured(1));
+        // 三个顶点跨两张贴图：拆不开就不采贴图，退回平面着色
+        assert!(
+            flat_tri(uv.to_vec(), vec![0, 0, 1], vec![t.clone(), solid_tex(9)])
+                .tri_textured(0, 1, 2)
+                .is_none()
+        );
+        assert!(
+            flat_tri(uv.to_vec(), vec![0, 0, NO_TEXTURE], vec![t.clone()])
+                .tri_textured(0, 1, 2)
+                .is_none()
+        );
+        // 贴图号越界 / 表为空 / UV 长度不符 → 都不能采样
+        assert!(
+            flat_tri(uv.to_vec(), vec![0, 0, 7], vec![t.clone()])
+                .tri_textured(0, 1, 2)
+                .is_none()
+        );
+        assert!(
+            flat_tri(uv.to_vec(), vec![0, 0, 0], vec![])
+                .tri_textured(0, 1, 2)
+                .is_none()
+        );
+        let short = flat_tri(vec![[0.0, 0.0]; 2], vec![0, 0, 0], vec![t]);
+        assert!(short.tri_textured(0, 1, 2).is_none());
+        assert!(!short.vertex_textured(0));
+    }
+
+    #[test]
+    fn append_mesh_dedups_shared_textures_and_remaps_ids() {
+        let shared = quad_tex();
+        let second = solid_tex(9);
+        let uv = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+
+        let mut out = Mesh::default();
+        out.append_mesh(
+            flat_tri(uv.to_vec(), vec![0, 0, 0], vec![shared.clone()]),
+            Mat4::IDENTITY,
+        );
+        out.append_mesh(
+            flat_tri(
+                uv.to_vec(),
+                vec![0, 1, 1],
+                vec![shared.clone(), second.clone()],
+            ),
+            Mat4::IDENTITY,
+        );
+
+        // 同一张 Arc 只入库一次，分片自己的 1 号图重映射成全局 1 号
+        assert_eq!(out.textures.len(), 2);
+        assert!(std::sync::Arc::ptr_eq(&out.textures[0], &shared));
+        assert!(std::sync::Arc::ptr_eq(&out.textures[1], &second));
+        assert_eq!(out.tex_ids.as_deref(), Some(&[0u32, 0, 0, 0, 1, 1][..]));
+        let uvs = out.uvs.clone().unwrap();
+        assert_eq!(uvs.len(), 6);
+        assert_eq!(uvs[4], uv[1]);
+
+        // 无贴图的分片并入有贴图的网格时补 NO_TEXTURE，不会被误判成贴图顶点
+        let mut plain = Mesh {
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 3],
+            colors: None,
+            indices: vec![0, 1, 2],
+            ..Default::default()
+        };
+        plain.append_mesh(
+            flat_tri(uv.to_vec(), vec![0, 0, 0], vec![shared.clone()]),
+            Mat4::IDENTITY,
+        );
+        assert_eq!(
+            plain.tex_ids.as_deref(),
+            Some(&[NO_TEXTURE, NO_TEXTURE, NO_TEXTURE, 0, 0, 0][..])
+        );
+        assert!(!plain.vertex_textured(0));
+        assert!(plain.vertex_textured(4));
+    }
+
+    /// 手工拼一个带 baseColorTexture 的 GLB：立方体 + 2x2 PNG，不依赖仓库外部文件
+    fn build_textured_glb() -> Vec<u8> {
+        let img = image::RgbaImage::from_raw(
+            2,
+            2,
+            vec![
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+            ],
+        )
+        .expect("2x2 rgba");
+        let mut png = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut png, image::ImageFormat::Png)
+            .expect("encode png");
+        let png = png.into_inner();
+
+        let pos: [[f32; 3]; 8] = [
+            [-0.5, -0.5, -0.5],
+            [0.5, -0.5, -0.5],
+            [-0.5, 0.5, -0.5],
+            [0.5, 0.5, -0.5],
+            [-0.5, -0.5, 0.5],
+            [0.5, -0.5, 0.5],
+            [-0.5, 0.5, 0.5],
+            [0.5, 0.5, 0.5],
+        ];
+        let uvs: [[f32; 2]; 8] = pos.map(|p| [p[0] + 0.5, p[1] + 0.5]);
+        const IDX: [u16; 36] = [
+            0, 1, 2, 2, 1, 3, // -z
+            4, 6, 5, 5, 6, 7, // +z
+            0, 4, 1, 1, 4, 5, // -y
+            2, 6, 3, 3, 6, 7, // +y
+            0, 2, 4, 4, 2, 6, // -x
+            1, 3, 5, 5, 3, 7, // +x
+        ];
+
+        let mut bin: Vec<u8> = Vec::new();
+        for p in &pos {
+            for v in p {
+                bin.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        let pos_view = (0usize, bin.len());
+        for u in &uvs {
+            for v in u {
+                bin.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        let uv_view = (pos_view.1, bin.len() - pos_view.1);
+        for i in &IDX {
+            bin.extend_from_slice(&i.to_le_bytes());
+        }
+        let idx_view = (uv_view.0 + uv_view.1, bin.len() - uv_view.0 - uv_view.1);
+        let img_view = (bin.len(), png.len());
+        bin.extend_from_slice(&png);
+
+        let json = serde_json::json!({
+            "asset": { "version": "2.0", "generator": "photoview-test" },
+            "scene": 0,
+            "scenes": [{ "nodes": [0] }],
+            "nodes": [{ "mesh": 0 }],
+            "meshes": [{
+                "primitives": [{
+                    "attributes": { "POSITION": 0, "TEXCOORD_0": 1 },
+                    "indices": 2,
+                    "material": 0,
+                }]
+            }],
+            "materials": [{
+                "pbrMetallicRoughness": {
+                    "baseColorTexture": { "index": 0, "texCoord": 0 },
+                    "metallicFactor": 0.0,
+                    "roughnessFactor": 1.0,
+                }
+            }],
+            "textures": [{ "sampler": 0, "source": 0 }],
+            "samplers": [{ "magFilter": 9729, "minFilter": 9729 }],
+            "images": [{ "bufferView": 3, "mimeType": "image/png" }],
+            "buffers": [{ "byteLength": bin.len() }],
+            "bufferViews": [
+                { "buffer": 0, "byteOffset": pos_view.0, "byteLength": pos_view.1, "target": 34962 },
+                { "buffer": 0, "byteOffset": uv_view.0, "byteLength": uv_view.1, "target": 34962 },
+                { "buffer": 0, "byteOffset": idx_view.0, "byteLength": idx_view.1, "target": 34963 },
+                { "buffer": 0, "byteOffset": img_view.0, "byteLength": img_view.1 },
+            ],
+            "accessors": [
+                {
+                    "bufferView": 0, "componentType": 5126, "count": 8, "type": "VEC3",
+                    "min": [-0.5, -0.5, -0.5], "max": [0.5, 0.5, 0.5]
+                },
+                { "bufferView": 1, "componentType": 5126, "count": 8, "type": "VEC2" },
+                { "bufferView": 2, "componentType": 5123, "count": 36, "type": "SCALAR" },
+            ]
+        });
+        let mut json_bytes = serde_json::to_vec(&json).expect("json");
+        let mut bin_bytes = bin;
+        while !json_bytes.len().is_multiple_of(4) {
+            json_bytes.push(b' ');
+        }
+        while !bin_bytes.len().is_multiple_of(4) {
+            bin_bytes.push(0);
+        }
+        let total = 12 + 8 + json_bytes.len() + 8 + bin_bytes.len();
+        let mut out = Vec::with_capacity(total);
+        out.extend_from_slice(b"glTF");
+        out.extend_from_slice(&2u32.to_le_bytes());
+        out.extend_from_slice(&(total as u32).to_le_bytes());
+        out.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0x4E4F_534Au32.to_le_bytes());
+        out.extend_from_slice(&json_bytes);
+        out.extend_from_slice(&(bin_bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0x004E_4942u32.to_le_bytes());
+        out.extend_from_slice(&bin_bytes);
+        out
+    }
+
+    #[test]
+    fn load_glb_texture_reaches_pixels() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("photoview_textured_{}.glb", std::process::id()));
+        std::fs::write(&path, build_textured_glb()).expect("write glb");
+        let loaded = Model3D::load_path(&path);
+        let _ = std::fs::remove_file(&path);
+        let model = loaded.expect("textured glb");
+        let (mesh, cam) = model.render_snapshot();
+
+        assert_eq!(mesh.vertex_count(), 8);
+        assert_eq!(mesh.triangle_count(), 12);
+        assert_eq!(mesh.textures.len(), 1, "贴图没进 Mesh");
+        assert_eq!((mesh.textures[0].width, mesh.textures[0].height), (2, 2));
+        let (uvs, ids) = mesh.texture_channels().expect("UV / 贴图号通道");
+        assert_eq!(uvs.len(), 8);
+        assert_eq!(ids.len(), 8);
+        assert!(ids.iter().all(|&i| i == 0));
+        assert_eq!(uvs[0], [0.0, 0.0]);
+
+        let pixels = render_mesh_ex(&mesh, &cam, 64, 64, false);
+        let dominant = |ch: usize| {
+            pixels
+                .iter()
+                .filter(|p| {
+                    let v = [p.r() as i32, p.g() as i32, p.b() as i32];
+                    let (hi, m1, m2) = match ch {
+                        0 => (v[0], v[1], v[2]),
+                        1 => (v[1], v[0], v[2]),
+                        _ => (v[2], v[0], v[1]),
+                    };
+                    hi > 60 && hi > m1 + 50 && hi > m2 + 50
+                })
+                .count()
+        };
+        let (red, green, blue) = (dominant(0), dominant(1), dominant(2));
+        assert!(
+            red > 4 && green > 4 && blue > 4,
+            "贴图未生效：red={red} green={green} blue={blue}"
+        );
+    }
+
+    /// 用真实导出文件验证贴图（文件不入库）：
+    /// `PHOTOVIEW_GLB=模型.glb cargo test -- --ignored load_real_glb_sample`
+    #[test]
+    #[ignore = "需要本机一个真实带贴图 GLB 路径"]
+    fn load_real_glb_sample() {
+        let path = std::env::var("PHOTOVIEW_GLB").expect("设置 PHOTOVIEW_GLB 指向 glb");
+        let model =
+            Model3D::load_path(Path::new(&path)).unwrap_or_else(|e| panic!("{path} 解析失败: {e}"));
+        let (mesh, cam) = model.render_snapshot();
+        let pixels = render_mesh_ex(&mesh, &cam, 128, 128, false);
+        let bg = pixels[0];
+        let (body, hues) = {
+            let mut body = 0usize;
+            let mut set = std::collections::HashSet::new();
+            for p in &pixels {
+                if *p != bg {
+                    body += 1;
+                    set.insert((p.r() / 24, p.g() / 24, p.b() / 24));
+                }
+            }
+            (body, set.len())
+        };
+        println!(
+            "{path}: {} 顶点 / {} 三角形 / {} 张贴图 / UV {} / 前景 {body} 像素 / {hues} 种色阶",
+            mesh.vertex_count(),
+            mesh.triangle_count(),
+            mesh.textures.len(),
+            mesh.uvs.as_ref().map_or(0, |u| u.len()),
+        );
+        assert!(mesh.triangle_count() >= 1);
+        assert!(body > 128 * 128 / 20, "模型几乎没画出来：{body}");
+        if !mesh.textures.is_empty() {
+            assert!(hues > 8, "贴图内容没进画面：色阶 {hues}");
+        }
     }
 }
