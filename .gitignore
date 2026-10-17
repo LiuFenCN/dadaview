@@ -2,4 +2,6 @@
 /bin
 /archive
 /_archive
+/dist
+/installer/obj
 *.exe

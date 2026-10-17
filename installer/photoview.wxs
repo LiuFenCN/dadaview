@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="PhotoView"
+           Language="2052"
+           Version="0.1.0"
+           Manufacturer="cathi"
+           Codepage="936"
+           UpgradeCode="7c4e2b9a-1f3d-4b8e-9a6c-2d5f8e1b7c30">
+
+    <Package InstallerVersion="500"
+             Compressed="yes"
+             InstallScope="perUser"
+             Platform="x64"
+             Description="PhotoView 图片查看器 + 3D 模型预览" />
+
+    <MajorUpgrade DowngradeErrorMessage="已安装更新版本的 PhotoView，请先在“应用和功能”中卸载。 / A newer version of PhotoView is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Property Id="ARPCOMMENTS" Value="图片查看器 + 3D 模型预览 / Image viewer with 3D model preview" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/LiuFenCN/photoview" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/LiuFenCN/photoview" />
+    <Property Id="ARPCONTACT" Value="https://bbs.cathi.cn · QQ 369748859" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="LocalAppDataFolder">
+        <Directory Id="ProgramsFolder" Name="Programs">
+          <Directory Id="INSTALLFOLDER" Name="PhotoView">
+            <Component Id="MainExe" Guid="3f6d1a24-8c57-4e3b-9d2a-1b4c6e8f0a12" Win64="yes">
+              <File Id="PhotoViewExe" Source="target\release\photoview.exe" />
+              <Shortcut Id="StartMenuShortcut"
+                        Directory="ProgramMenuDir"
+                        Name="PhotoView"
+                        Description="图片查看器 + 3D 模型预览"
+                        Target="[#PhotoViewExe]"
+                        WorkingDirectory="INSTALLFOLDER" />
+              <Shortcut Id="DesktopShortcutLnk"
+                        Directory="DesktopFolder"
+                        Name="PhotoView"
+                        Description="图片查看器 + 3D 模型预览"
+                        Target="[#PhotoViewExe]"
+                        WorkingDirectory="INSTALLFOLDER" />
+              <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
+              <RemoveFolder Id="RemoveProgramsFolder" Directory="ProgramsFolder" On="uninstall" />
+              <RemoveFolder Id="RemoveProgramMenuDir" Directory="ProgramMenuDir" On="uninstall" />
+              <!-- 按当前用户安装到 LocalAppData，组件键路径必须是 HKCU 注册表项（ICE38） -->
+              <RegistryValue Root="HKCU" Key="Software\PhotoView" Name="InstallDir" Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
+            </Component>
+            <Component Id="Docs" Guid="9c2e5b71-4a3d-4f86-b0c9-7e1d5a2b3c44" Win64="yes">
+              <File Id="ReadmeFile" Source="README.md" />
+              <File Id="LicenseFile" Source="LICENSE" />
+              <RegistryValue Root="HKCU" Key="Software\PhotoView" Name="DocsInstalled" Type="integer" Value="1" KeyPath="yes" />
+            </Component>
+          </Directory>
+        </Directory>
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ProgramMenuDir" Name="PhotoView" />
+      </Directory>
+      <Directory Id="DesktopFolder" />
+    </Directory>
+
+    <Feature Id="MainFeature" Title="PhotoView" Level="1">
+      <ComponentRef Id="MainExe" />
+      <ComponentRef Id="Docs" />
+    </Feature>
+
+    <UIRef Id="WixUI_InstallDir" />
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    <WixVariable Id="WixUILicenseRtf" Value="installer\license.rtf" />
+  </Product>
+</Wix>
