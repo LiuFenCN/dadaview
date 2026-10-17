@@ -254,11 +254,23 @@ impl AppSettings {
     pub(crate) fn load() -> Self {
         let path = settings_path();
 
-        if path.exists()
-            && let Ok(data) = std::fs::read_to_string(&path)
+        if let Ok(data) = std::fs::read_to_string(&path)
             && let Ok(s) = serde_json::from_str(&data)
         {
             return s;
+        }
+
+        // 旧版把 settings.json 放在 exe 旁边；安装到 Program Files 后那里不可写，迁移到 AppData
+
+        let legacy = exe_dir().join("settings.json");
+
+        if legacy != path
+            && let Ok(data) = std::fs::read_to_string(&legacy)
+            && let Ok(s) = serde_json::from_str(&data)
+        {
+            let settings: Self = s;
+            settings.save();
+            return settings;
         }
 
         Self::default()
@@ -268,6 +280,10 @@ impl AppSettings {
         let path = settings_path();
 
         if let Ok(data) = serde_json::to_string_pretty(self) {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+
             let _ = std::fs::write(&path, data);
         }
     }
@@ -302,8 +318,16 @@ pub(crate) fn exe_dir() -> PathBuf {
         .to_path_buf()
 }
 
+/// 用户配置目录。装到 Program Files 后 exe 目录对普通用户只读，配置放 AppData
+pub(crate) fn settings_dir() -> PathBuf {
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(exe_dir)
+        .join("DaDaView")
+}
+
 pub(crate) fn settings_path() -> PathBuf {
-    exe_dir().join("settings.json")
+    settings_dir().join("settings.json")
 }
 
 #[cfg(test)]
