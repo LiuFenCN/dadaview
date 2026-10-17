@@ -1,4 +1,4 @@
-# PhotoView
+# DaDaView
 
 **Windows 图片查看器 + 3D 模型预览** · A fast, lightweight image viewer with built-in 3D model preview for Windows.
 
@@ -21,12 +21,12 @@
 
 ## 下载 · Download
 
-从 [Releases](https://github.com/LiuFenCN/photoview/releases/latest) 下载：
+从 [Releases](https://github.com/LiuFenCN/dadaview/releases/latest) 下载：
 
-- `PhotoView-*-x64-setup.msi` —— 安装版，默认装到 `C:\Program Files\PhotoView`，安装向导中可自定义安装目录（需要管理员权限）
-- `PhotoView-*-x64-portable.zip` —— 免安装版，解压后直接运行 `photoview.exe`，无需管理员权限
+- `DaDaView-*-x64-setup.msi` —— 安装版，默认装到 `C:\Program Files\DaDaView`，安装向导中可自定义安装目录（需要管理员权限）
+- `DaDaView-*-x64-portable.zip` —— 免安装版，解压后直接运行 `dadaview.exe`，无需管理员权限
 
-安装版会创建桌面和开始菜单快捷方式；安装位置在向导的“目标文件夹”页可浏览或直接输入，例如改到 `D:\Programs\PhotoView`。安装包未做代码签名，首次运行时 Windows SmartScreen 可能提示“未知发布者”，选择“更多信息 → 仍要运行”即可。
+安装版会创建桌面和开始菜单快捷方式；安装位置在向导的“目标文件夹”页可浏览或直接输入，例如改到 `D:\Programs\DaDaView`。安装包未做代码签名，首次运行时 Windows SmartScreen 可能提示“未知发布者”，选择“更多信息 → 仍要运行”即可。
 
 ## 支持格式 · Supported formats
 
@@ -42,11 +42,11 @@
 cargo build --release
 ```
 
-产物为 `target/release/photoview.exe`。安装包用 WiX Toolset 3.11 生成，脚本在 [installer/photoview.wxs](installer/photoview.wxs)：
+产物为 `target/release/dadaview.exe`。安装包用 WiX Toolset 3.11 生成，脚本在 [installer/dadaview.wxs](installer/dadaview.wxs)：
 
 ```bash
-candle.exe -arch x64 -out installer/obj/photoview.wixobj installer/photoview.wxs
-light.exe -ext WixUIExtension -cultures:zh-CN -out dist/PhotoView-0.1.0-x64-setup.msi installer/obj/photoview.wixobj
+candle.exe -arch x64 -out installer/obj/dadaview.wixobj installer/dadaview.wxs
+light.exe -ext WixUIExtension -cultures:zh-CN -out dist/DaDaView-0.1.0-x64-setup.msi installer/obj/dadaview.wixobj
 ```
 
 ## 测试 · Tests
@@ -58,18 +58,18 @@ cargo test
 用本机真实文件做手动回归：
 
 ```bash
-PHOTOVIEW_FBX=模型.fbx cargo test -- --ignored load_real_fbx_sample
-PHOTOVIEW_GLB=模型.glb cargo test -- --ignored load_real_glb_sample
+DADAVIEW_FBX=模型.fbx cargo test -- --ignored load_real_fbx_sample
+DADAVIEW_GLB=模型.glb cargo test -- --ignored load_real_glb_sample
 ```
 
 ## 联系 · Contact
 
 - 论坛 / Forum：<https://bbs.cathi.cn>
 - QQ 群 / QQ Group：369748859
-- 问题反馈 / Issues：<https://github.com/LiuFenCN/photoview/issues>
+- 问题反馈 / Issues：<https://github.com/LiuFenCN/dadaview/issues>
 
 ## 许可 · License
 
 GNU Affero General Public License v3.0，见 [LICENSE](LICENSE)。
 
-Copyright (c) 2026 cathi
+Copyright (c) 2026 LiuFenCN

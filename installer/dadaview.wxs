@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <Product Id="*"
-           Name="PhotoView"
+           Name="DaDaView"
            Language="2052"
            Version="0.1.0"
-           Manufacturer="cathi"
+           Manufacturer="LiuFenCN"
            Codepage="936"
            UpgradeCode="7c4e2b9a-1f3d-4b8e-9a6c-2d5f8e1b7c30">
 
@@ -13,30 +13,31 @@
              InstallScope="perMachine"
              InstallPrivileges="elevated"
              Platform="x64"
-             Description="PhotoView 图片查看器 + 3D 模型预览" />
+             Description="DaDaView 图片查看器 + 3D 模型预览" />
 
-    <MajorUpgrade DowngradeErrorMessage="已安装更新版本的 PhotoView，请先在“应用和功能”中卸载。 / A newer version of PhotoView is already installed." />
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="已安装更新版本的 DaDaView，请先在“应用和功能”中卸载。 / A newer version of DaDaView is already installed." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
-    <Property Id="ARPCOMMENTS" Value="图片查看器 + 3D 模型预览 / Image viewer with 3D model preview" />
-    <Property Id="ARPHELPLINK" Value="https://github.com/LiuFenCN/photoview" />
-    <Property Id="ARPURLINFOABOUT" Value="https://github.com/LiuFenCN/photoview" />
+    <Property Id="ARPCOMMENTS" Value="DaDaView 图片查看器 + 3D 模型预览 / Image viewer with 3D model preview" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/LiuFenCN/dadaview" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/LiuFenCN/dadaview" />
     <Property Id="ARPCONTACT" Value="https://bbs.cathi.cn · QQ 369748859" />
 
     <Directory Id="TARGETDIR" Name="SourceDir">
       <Directory Id="ProgramFiles64Folder">
-        <Directory Id="INSTALLFOLDER" Name="PhotoView">
+        <Directory Id="INSTALLFOLDER" Name="DaDaView">
           <Component Id="MainExe" Guid="3f6d1a24-8c57-4e3b-9d2a-1b4c6e8f0a12" Win64="yes">
-            <File Id="PhotoViewExe" Source="target\release\photoview.exe" KeyPath="yes" />
+            <File Id="DaDaViewExe" Source="target\release\dadaview.exe" KeyPath="yes" />
             <Shortcut Id="StartMenuShortcut"
                       Directory="ProgramMenuDir"
-                      Name="PhotoView"
+                      Name="DaDaView"
                       Description="图片查看器 + 3D 模型预览"
                       Advertise="yes"
                       WorkingDirectory="INSTALLFOLDER" />
             <Shortcut Id="DesktopShortcutLnk"
                       Directory="DesktopFolder"
-                      Name="PhotoView"
+                      Name="DaDaView"
                       Description="图片查看器 + 3D 模型预览"
                       Advertise="yes"
                       WorkingDirectory="INSTALLFOLDER" />
@@ -46,17 +47,17 @@
           <Component Id="Docs" Guid="9c2e5b71-4a3d-4f86-b0c9-7e1d5a2b3c44" Win64="yes">
             <File Id="ReadmeFile" Source="README.md" />
             <File Id="LicenseFile" Source="LICENSE" />
-            <RegistryValue Root="HKLM" Key="Software\PhotoView" Name="DocsInstalled" Type="integer" Value="1" KeyPath="yes" />
+            <RegistryValue Root="HKLM" Key="Software\DaDaView" Name="DocsInstalled" Type="integer" Value="1" KeyPath="yes" />
           </Component>
         </Directory>
       </Directory>
       <Directory Id="ProgramMenuFolder">
-        <Directory Id="ProgramMenuDir" Name="PhotoView" />
+        <Directory Id="ProgramMenuDir" Name="DaDaView" />
       </Directory>
       <Directory Id="DesktopFolder" />
     </Directory>
 
-    <Feature Id="MainFeature" Title="PhotoView" Level="1">
+    <Feature Id="MainFeature" Title="DaDaView" Level="1">
       <ComponentRef Id="MainExe" />
       <ComponentRef Id="Docs" />
     </Feature>

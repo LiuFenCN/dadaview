@@ -1,10 +1,10 @@
 [package]
-name = "photoview"
+name = "dadaview"
 version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-only"
-description = "Windows image viewer with 3D model preview"
-repository = "https://github.com/LiuFenCN/photoview"
+description = "DaDaView — Windows image viewer with 3D model preview"
+repository = "https://github.com/LiuFenCN/dadaview"
 readme = "README.md"
 
 [dependencies]
@@ -39,5 +39,5 @@ codegen-units = 1
 strip = true
 
 [[bin]]
-name = "photoview"
+name = "dadaview"
 path = "src/main.rs"

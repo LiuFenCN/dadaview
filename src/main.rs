@@ -85,7 +85,7 @@ fn sort_files(files: &mut Vec<PathBuf>, sort_by: &str) {
 
 // ─── 主应用 ───────────────────────────────────────
 
-struct PhotoViewApp {
+struct DaDaViewApp {
     current_texture: Option<TextureHandle>,
 
     current_pixels: Vec<Color32>, // 当前纹理像素副本，用于箭头颜色自适应
@@ -202,7 +202,7 @@ struct PhotoViewApp {
     last_drop_path: Option<PathBuf>,
 }
 
-impl Default for PhotoViewApp {
+impl Default for DaDaViewApp {
     fn default() -> Self {
         let settings = AppSettings::load();
 
@@ -317,7 +317,7 @@ impl Default for PhotoViewApp {
     }
 }
 
-impl PhotoViewApp {
+impl DaDaViewApp {
     /// 在独立线程弹系统文件对话框，结果经 file_dialog_result 回传，不阻塞 UI
     fn spawn_file_dialog(&self) {
         let dest = self.file_dialog_result.clone();
@@ -2567,7 +2567,7 @@ impl PhotoViewApp {
     }
 }
 
-impl eframe::App for PhotoViewApp {
+impl eframe::App for DaDaViewApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.round_corners_applied {
             self.round_corners_applied = true;
@@ -3041,7 +3041,7 @@ impl eframe::App for PhotoViewApp {
                         ui.add_space(ui.available_height() * 0.35);
 
                         ui.heading(
-                            RichText::new("🖼 PhotoView")
+                            RichText::new("🖼 DaDaView")
                                 .size(28.0)
                                 .color(Color32::WHITE),
                         );
@@ -3478,7 +3478,7 @@ fn main() -> eframe::Result<()> {
     let options = NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([800.0, 600.0])
-            .with_title("PhotoView")
+            .with_title("DaDaView")
             .with_decorations(false)
             .with_transparent(true)
             .with_resizable(true),
@@ -3487,7 +3487,7 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "PhotoView",
+        "DaDaView",
         options,
         Box::new(|cc| {
             let mut fonts = egui::FontDefinitions::default();
@@ -3521,7 +3521,7 @@ fn main() -> eframe::Result<()> {
 
             cc.egui_ctx.set_fonts(fonts);
 
-            let app = PhotoViewApp {
+            let app = DaDaViewApp {
                 initial_path,
                 ..Default::default()
             };
@@ -3553,11 +3553,11 @@ mod tests {
     #[test]
     fn take_slot_only_when_path_matches() {
         let s = slot(Some(pre("a.png")));
-        let miss = PhotoViewApp::take_slot_if_match(&s, std::path::Path::new("b.png"), |p| &p.path);
+        let miss = DaDaViewApp::take_slot_if_match(&s, std::path::Path::new("b.png"), |p| &p.path);
         assert!(miss.is_none(), "不匹配必须返回 None");
         assert!(s.lock().unwrap().is_some(), "不匹配时槽位原样保留");
 
-        let hit = PhotoViewApp::take_slot_if_match(&s, std::path::Path::new("a.png"), |p| &p.path);
+        let hit = DaDaViewApp::take_slot_if_match(&s, std::path::Path::new("a.png"), |p| &p.path);
         assert!(hit.is_some(), "匹配必须取出");
         assert!(s.lock().unwrap().is_none(), "取出后槽位清空");
     }
@@ -3569,7 +3569,7 @@ mod tests {
         let near = slot(Some(pre("x.png")));
         let far = slot(Some(pre("a.png")));
 
-        PhotoViewApp::refill_dir(&near, &far, Some(PathBuf::from("a.png")), None);
+        DaDaViewApp::refill_dir(&near, &far, Some(PathBuf::from("a.png")), None);
 
         assert_eq!(
             near.lock().unwrap().as_ref().map(|p| p.path.as_path()),
@@ -3586,7 +3586,7 @@ mod tests {
     fn refill_dir_reuses_both_slots_without_reloading() {
         let near = slot(Some(pre("a.png")));
         let far = slot(Some(pre("b.png")));
-        PhotoViewApp::refill_dir(
+        DaDaViewApp::refill_dir(
             &near,
             &far,
             Some(PathBuf::from("a.png")),
@@ -3607,7 +3607,7 @@ mod tests {
         // 远近目标相同（小目录首尾重叠）：只应命中一个，另一个槽留空且不重复加载
         let near = slot(None);
         let far = slot(Some(pre("only.png")));
-        PhotoViewApp::refill_dir(
+        DaDaViewApp::refill_dir(
             &near,
             &far,
             Some(PathBuf::from("only.png")),
@@ -3681,7 +3681,7 @@ mod tests {
     #[allow(clippy::field_reassign_with_default)]
     #[test]
     fn comic_steps_skip_model_files() {
-        let mut app = PhotoViewApp::default();
+        let mut app = DaDaViewApp::default();
         app.image_files = ["a.png", "b.obj", "c.stl", "d.png", "e.png"]
             .iter()
             .map(PathBuf::from)
@@ -3704,7 +3704,7 @@ mod tests {
     #[allow(clippy::field_reassign_with_default)]
     #[test]
     fn comic_next_spread_is_two_real_pages_away() {
-        let mut app = PhotoViewApp::default();
+        let mut app = DaDaViewApp::default();
         app.image_files = ["a.png", "b.png", "c.obj", "d.png", "e.png", "f.png"]
             .iter()
             .map(PathBuf::from)

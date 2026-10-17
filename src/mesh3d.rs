@@ -3430,11 +3430,11 @@ mod tests {
         assert_cube(&mesh);
     }
     /// 用真实导出文件验证解析器（文件不入库）：
-    /// `PHOTOVIEW_FBX=模型.fbx cargo test -- --ignored load_real_fbx_sample`
+    /// `DADAVIEW_FBX=模型.fbx cargo test -- --ignored load_real_fbx_sample`
     #[test]
     #[ignore = "需要本机一个真实二进制 FBX 文件路径"]
     fn load_real_fbx_sample() {
-        let path = std::env::var("PHOTOVIEW_FBX").expect("设置 PHOTOVIEW_FBX 指向二进制 fbx");
+        let path = std::env::var("DADAVIEW_FBX").expect("设置 DADAVIEW_FBX 指向二进制 fbx");
         let data = std::fs::read(&path).unwrap();
         let name = Path::new(&path)
             .file_name()
@@ -3731,7 +3731,7 @@ mod tests {
         bin.extend_from_slice(&png);
 
         let json = serde_json::json!({
-            "asset": { "version": "2.0", "generator": "photoview-test" },
+            "asset": { "version": "2.0", "generator": "dadaview-test" },
             "scene": 0,
             "scenes": [{ "nodes": [0] }],
             "nodes": [{ "mesh": 0 }],
@@ -3793,7 +3793,7 @@ mod tests {
     #[test]
     fn load_glb_texture_reaches_pixels() {
         let mut path = std::env::temp_dir();
-        path.push(format!("photoview_textured_{}.glb", std::process::id()));
+        path.push(format!("dadaview_textured_{}.glb", std::process::id()));
         std::fs::write(&path, build_textured_glb()).expect("write glb");
         let loaded = Model3D::load_path(&path);
         let _ = std::fs::remove_file(&path);
@@ -3833,11 +3833,11 @@ mod tests {
     }
 
     /// 用真实导出文件验证贴图（文件不入库）：
-    /// `PHOTOVIEW_GLB=模型.glb cargo test -- --ignored load_real_glb_sample`
+    /// `DADAVIEW_GLB=模型.glb cargo test -- --ignored load_real_glb_sample`
     #[test]
     #[ignore = "需要本机一个真实带贴图 GLB 路径"]
     fn load_real_glb_sample() {
-        let path = std::env::var("PHOTOVIEW_GLB").expect("设置 PHOTOVIEW_GLB 指向 glb");
+        let path = std::env::var("DADAVIEW_GLB").expect("设置 DADAVIEW_GLB 指向 glb");
         let model =
             Model3D::load_path(Path::new(&path)).unwrap_or_else(|e| panic!("{path} 解析失败: {e}"));
         let (mesh, cam) = model.render_snapshot();

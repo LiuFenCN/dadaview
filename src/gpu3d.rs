@@ -207,7 +207,7 @@ impl GpuRenderer {
         }))?;
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
-                label: Some("photoview-3d"),
+                label: Some("dadaview-3d"),
                 required_features: wgpu::Features::empty(),
                 required_limits:
                     wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
