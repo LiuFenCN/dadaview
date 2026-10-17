@@ -23,10 +23,10 @@
 
 从 [Releases](https://github.com/LiuFenCN/photoview/releases/latest) 下载：
 
-- `PhotoView-*-x64-setup.msi` —— 安装包，安装到当前用户目录（`%LOCALAPPDATA%\Programs\PhotoView`），无需管理员权限
-- `PhotoView-*-x64-portable.zip` —— 免安装版，解压后直接运行 `photoview.exe`
+- `PhotoView-*-x64-setup.msi` —— 安装版，默认装到 `C:\Program Files\PhotoView`，安装向导中可自定义安装目录（需要管理员权限）
+- `PhotoView-*-x64-portable.zip` —— 免安装版，解压后直接运行 `photoview.exe`，无需管理员权限
 
-安装包未做代码签名，首次运行时 Windows SmartScreen 可能提示“未知发布者”，选择“更多信息 → 仍要运行”即可。
+安装版会创建桌面和开始菜单快捷方式；安装位置在向导的“目标文件夹”页可浏览或直接输入，例如改到 `D:\Programs\PhotoView`。安装包未做代码签名，首次运行时 Windows SmartScreen 可能提示“未知发布者”，选择“更多信息 → 仍要运行”即可。
 
 ## 支持格式 · Supported formats
 
