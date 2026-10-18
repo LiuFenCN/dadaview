@@ -2,6 +2,21 @@
 
 本项目的所有重要变更记录。版本号遵循 `主.次.修订`。
 
+## [未发布] - 2026-10-18
+
+### 新增
+
+- **软件图标**（`assets/dadaview.ico`、`assets/dadaview-512.png`）
+  -  mascot 插画（粉毛猫娘 + 放大镜看方块猫）制成多尺寸图标：16 / 24 / 32 / 48 / 64 / 128 / 256 px，PNG 压缩条目，Lanczos 缩放 + USM 锐化；512×512 母图另行保存（ICO 规范的目录项宽高各 1 字节，单帧上限即 256）
+  - **exe 图标资源**：新增 `src/bin/embed-icon.rs` 工具，用 kernel32 的 `BeginUpdateResourceW / UpdateResourceW / EndUpdateResourceW` 把 ico 写入 PE 的 RT_ICON / RT_GROUP_ICON，不依赖 rc.exe / windres / winres。资源管理器缩略图、任务栏、`DefaultIcon` 注册表（`file_assoc.rs` 早已指向 `exe,0`）随即生效
+  - **窗口图标**：`src/main.rs` 编译期内嵌 512 PNG（`include_bytes!`），经 `ViewportBuilder::with_icon` 设置——免安装版不附带 assets 目录也有标题栏/任务栏图标
+  - **安装包图标**：`installer/dadaview.wxs` 增加 `<Icon Id="DaDaViewIcon">` + `ARPPRODUCTICON`，「应用和功能」与安装向导显示应用图标；安装版启动器（setup.exe）同样嵌入图标
+  - 验证：`embed-icon --verify` 对三个 exe 逐一确认图标组可加载；MSI 经 ICE 校验（仅预期内 ICE61 提示）；解包 MSI 比对 SHA256，内置 exe 与带图标的本地构建逐字节一致
+
+### 文档
+
+- README 构建章节更新为 WiX v5 CLI 与图标嵌入的完整流程（原文停留在 WiX v3 的 candle/light 命令）
+
 ## [未发布] - 2026-10-17
 
 ### 修复
