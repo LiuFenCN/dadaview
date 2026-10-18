@@ -2,6 +2,36 @@
 
 本项目的所有重要变更记录。版本号遵循 `主.次.修订`。
 
+## [未发布] - 2026-10-19
+
+### 新增
+
+- **许可协议中文化**（`LICENSE.zh-CN.md`）
+  - `LICENSE` 保留 GNU AGPL v3 英文官方原文（具法律效力）；新增中文要点导读，覆盖：四条自由、六项义务、第 13 条网络服务条款（AGPL 与 GPL 的关键差异）、担保免责、分发前检查清单
+  - 安装向导许可页改为「中文导读 → 分隔线 → 英文原文」，并在导读开头明确声明仅供参考、歧义以英文为准
+  - `LICENSE.zh-CN.md` 一并进入安装包 payload 与免安装版压缩包
+
+- **安装器支持升级 / 修复检测**（`installer/launcher/src/main.rs`）
+  - 新增 `detect_installed()`：读 `HKLM\...\Uninstall\DaDaView` 取版本与安装位置；再枚举 `Uninstall` 根键，通过 `DisplayName == DaDaView` + `UninstallString` 含 `msiexec`（或子键名形如 `{GUID}`）识别旧 MSI 版遗留条目
+  - 欢迎页据此显示：已安装版本、原安装位置、本次属于「升级安装 / 修复安装（覆盖同版本）/ 降级安装」（版本按点分数字段逐段比较）
+  - 「选择安装目录」页把默认值预填为原安装位置，避免同一程序装出两份
+  - 检测到旧 MSI 记录时，目录页多出勾选项「清理旧的 MSI 安装记录」——只删注册表键，**不动任何已安装文件**，也不调用 msiexec（规避 2502/2503）。共清理三处：`Uninstall\{GUID}`（「应用和功能」列表里的重复项来源）、`Installer\UserData\<SID>\Products\<packed>`（MSI 每用户安装属性，含 `LocalPackage`）、`Classes\Installer\Products\<packed>`（MSI 产品注册）。只删前两处会让 MSI 内部仍认为产品已安装
+  - `--quiet` 静默安装同样沿用原安装位置并自动清理 MSI 记录
+  - 写入「应用和功能」条目时补上 `InstallDate`（YYYYMMDD），列表里的安装日期不再靠系统猜测
+  - 覆盖正在运行的 exe 时给出「请先退出 DaDaView」的明确提示，而非裸的「拒绝访问」
+
+### 修复
+
+- **exe 完全没有版本信息资源**
+  - 现象：右键 `dadaview.exe` / `setup.exe` → 属性 → 详细信息，文件版本、产品版本、产品名称、版权全部为空
+  - 修复：`src/bin/embed-icon.rs` 扩展为同时写 `RT_VERSION`，手写 `VS_VERSIONINFO` 结构（`VS_FIXEDFILEINFO` + `StringFileInfo\040904B0` + `VarFileInfo\Translation`），所有子块按 DWORD 对齐
+  - 坑：`VS_VERSIONINFO` 的 padding 必须**相对整个块起始**计算（块头 6 字节也要算进去），只按 body 长度对齐会让 Windows 完全读不到版本资源——写入成功但属性页依然空白
+  - 版本号从根 `Cargo.toml` 读取，三个 exe（主程序 / 卸载器 / 安装器）统一
+
+- **版本号不再需要改多处**
+  - `installer/launcher/build.rs` 读根 `Cargo.toml` 的 `[package] version`，通过 `cargo:rustc-env=DADAVIEW_VERSION` 注入，安装器的 `APP_VERSION` 改用 `env!("DADAVIEW_VERSION")`
+  - 实测：把根 `Cargo.toml` 改成 0.9.9 → 构建输出立刻显示「DaDaView 版本号：0.9.9」，改回即恢复
+
 ## [未发布] - 2026-10-18
 
 ### 新增
@@ -16,6 +46,25 @@
 ### 文档
 
 - README 构建章节更新为 WiX v5 CLI 与图标嵌入的完整流程（原文停留在 WiX v3 的 candle/light 命令）
+
+### 安装器
+
+- **安装器从 WiX/MSI 改为纯 exe 方案**（`installer/launcher` + 新增 `installer/uninstaller`）
+  - 背景：部分系统运行 MSI 报 2503/2502（Windows Installer 组件错误），且 MSI 快捷方式图标、目标指向连续踩坑（通告式快捷方式不读 exe 图标资源；非通告式不写 Target 时默认指向安装目录）。纯 exe 方案不调用 msiexec，彻底规避该类错误
+  - 安装器流程：UAC 提权（未提权则经 ShellExecuteExW runas 重启自身）→ IFileDialog 选择安装目录（默认 `C:\Program Files\DaDaView`，`--quiet` 跳过对话框）→ 释放 payload → IShellLinkW 创建开始菜单/桌面快捷方式（IconLocation 指向 exe，即用 exe 内嵌图标）→ 写 HKLM 卸载注册表项（DisplayName/DisplayIcon/UninstallString/EstimatedSize 等）
+  - payload（dadaview.exe + README + LICENSE + 卸载器）由 `build.rs` 构建期打成 deflate zip 内嵌，安装时解压；安装器 6.6MB（原始 payload 14.6MB）
+  - 卸载器（211KB）：删除快捷方式与注册表项后，经隐藏 cmd 延迟 rmdir 移除安装目录（含自身）
+  - windows 0.58 API 坑：注册表函数返回 `WIN32_ERROR` 新建结构体（`.0` 取 u32，无 From 转换，需自行转 `Error::from_hresult(HRESULT::from_win32)`）；`IPersistFile` 在 `Win32::System::Com`；接口转换 `.cast()` 需 `use windows::core::Interface`；IShellLinkW 的方法为 PCWSTR 泛型（ANSI 版才是 PCSTR）
+  - 验证：payload 解压单元测试（与源构建逐字节一致）；从成品 setup.exe 中挖出内嵌 zip 核对 4 个文件 SHA256 全部匹配；图标 `--verify` 通过
+  - 不再分发 `setup.msi`；`installer/dadaview.wxs` 停用保留
+
+- **安装器自带原生向导界面**（`installer/launcher/src/main.rs`）
+  - 背景：去掉 MSI 后，双击 setup.exe 只剩一个「选择目录」对话框，缺少许可协议、进度反馈与完成页
+  - 实现：手写 Win32 窗口（不引入 egui/GUI 依赖），五页向导：欢迎 → 许可协议（内嵌 LICENSE，必须勾选接受才能「下一步」）→ 选择安装目录（可浏览更改，含所需空间与两个快捷方式勾选项）→ 安装进度（进度条 + 当前文件 + 百分比）→ 完成（可勾选立即运行）
+  - 经典布局：顶部白色页头带标题与当前步骤名，底部「上一步 / 下一步 / 取消」按钮与分割线；随页面切换按钮文案与可用状态自动变化
+  - 进度刷新：安装动作放后台线程，主线程用消息泵保持界面响应，逐文件更新进度；安装期间禁用所有按钮并拦截关闭，避免半途退出
+  - DPI：进程声明 Per-Monitor V2 感知，按系统 DPI 缩放窗口尺寸与字体，高分屏不模糊
+  - windows 0.58 补充坑：`EnableWindow` / `SetFocus` 在 `Win32::UI::Input::KeyboardAndMouse`，而 `UpdateWindow` / `InvalidateRect` 在 `Win32::Graphics::Gdi`（并非全在 `WindowsAndMessaging`）；`CreateWindowExW` 返回 `Result<HWND>` 而非裸句柄；句柄参数不接受 `Option<HWND>`，要传 `HWND::default()`；`GetModuleHandleW` 返回 `HMODULE`，需转成 `HINSTANCE`
 
 ## [未发布] - 2026-10-17
 

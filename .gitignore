@@ -5,9 +5,11 @@
 /dist
 /installer/obj
 /installer/launcher/target
+/installer/uninstaller/target
 *.exe
 
 # WorkBuddy agent workspace
 /.workbuddy
 /.scratch2
+/.scratch
 /.wix

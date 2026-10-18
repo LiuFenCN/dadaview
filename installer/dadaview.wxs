@@ -25,19 +25,24 @@
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="DaDaView">
         <Component Id="MainExe" Guid="3f6d1a24-8c57-4e3b-9d2a-1b4c6e8f0a12" Bitness="always64">
-          <File Id="DaDaViewExe" Source="target\release\dadaview.exe" KeyPath="yes" />
+          <File Id="DaDaViewExe" Source="target\release\dadaview.exe" KeyPath="yes">
           <Shortcut Id="StartMenuShortcut"
                     Directory="ProgramMenuDir"
                     Name="DaDaView"
                     Description="图片查看器 + 3D 模型预览"
-                    Advertise="yes"
+                    Advertise="no"
+                    Icon="DaDaViewIcon"
+                    IconIndex="0"
                     WorkingDirectory="INSTALLFOLDER" />
           <Shortcut Id="DesktopShortcutLnk"
                     Directory="DesktopFolder"
                     Name="DaDaView"
                     Description="图片查看器 + 3D 模型预览"
-                    Advertise="yes"
+                    Advertise="no"
+                    Icon="DaDaViewIcon"
+                    IconIndex="0"
                     WorkingDirectory="INSTALLFOLDER" />
+          </File>
           <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
           <RemoveFolder Id="RemoveProgramMenuDir" Directory="ProgramMenuDir" On="uninstall" />
         </Component>

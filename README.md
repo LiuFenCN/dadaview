@@ -23,11 +23,16 @@
 
 从 [Releases](https://github.com/LiuFenCN/dadaview/releases/latest) 下载：
 
-- `DaDaView-*-x64-setup.exe` —— 安装版（推荐）：双击后自动请求管理员权限，内置 MSI，默认装到 `C:\Program Files\DaDaView`，向导中可自定义安装目录；支持 `--quiet` 静默安装
-- `DaDaView-*-x64-setup.msi` —— 同一安装包的 MSI，供批量部署或高级用户使用，需要从管理员命令提示符运行
+- `DaDaView-*-x64-setup.exe` —— 安装版（推荐）：双击后自动请求管理员权限，随后进入安装向导：欢迎 → 许可协议 → 选择安装目录（默认 `C:\Program Files\DaDaView`，可浏览更改）→ 安装进度 → 完成。安装器为纯 exe（自释放 payload，不走 Windows Installer / msiexec），会创建桌面与开始菜单快捷方式、写入「应用和功能」卸载项（含独立卸载程序）。支持 `--quiet` 静默安装
 - `DaDaView-*-x64-portable.zip` —— 免安装版，解压后直接运行 `dadaview.exe`，无需管理员权限
 
-安装版会创建桌面和开始菜单快捷方式；安装位置在向导的“目标文件夹”页可浏览或直接输入，例如改到 `D:\Programs\DaDaView`。安装包未做代码签名，首次运行时 Windows SmartScreen 可能提示“未知发布者”，选择“更多信息 → 仍要运行”即可。
+安装位置在向导的「选择安装目录」页中指定，例如改到 `D:\Programs\DaDaView`。安装包未做代码签名，首次运行时 Windows SmartScreen 可能提示“未知发布者”，选择“更多信息 → 仍要运行”即可。
+
+**升级与修复**：安装器启动时会先读取注册表，检测本机是否已有安装。若已安装，欢迎页会显示当前版本、原安装位置以及本次是「升级 / 修复（同版本覆盖）/ 降级」，并把安装目录预填为原位置，避免装出两份。若检测到旧 MSI 版遗留的安装记录，会提供勾选项将其一并清理（只删「应用和功能」里的记录，不动任何已安装文件）。
+
+**版本号**：只维护根 `Cargo.toml` 的 `version` 一处。安装器的版本号、`exe` 属性页里的「文件版本 / 产品版本」、以及「应用和功能」里显示的版本都会自动跟随。
+
+**许可协议**：`LICENSE` 为 GNU AGPL v3 官方英文原文（具法律效力）；`LICENSE.zh-CN.md` 是中文要点导读，仅供参考。安装向导的许可页会先显示中文导读、再显示英文原文。
 
 ## 支持格式 · Supported formats
 
@@ -43,29 +48,43 @@
 cargo build --release
 ```
 
-产物为 `target/release/dadaview.exe`。图标资源（`assets/dadaview.ico`）不进二进制源码，由 `embed-icon` 工具在编译后写入 exe（走 kernel32 资源更新 API，无需 rc.exe / windres）：
+产物为 `target/release/dadaview.exe`。图标资源（`assets/dadaview.ico`）与版本信息（VERSIONINFO）都不进二进制源码，由 `embed-icon` 工具在编译后写入 exe（走 kernel32 资源更新 API，无需 rc.exe / windres / winres）：
 
 ```bash
 cargo build --release
-./target/release/embed-icon.exe target/release/dadaview.exe            # 嵌入图标
-./target/release/embed-icon.exe --verify target/release/dadaview.exe   # 验证资源可加载
+./target/release/embed-icon.exe target/release/dadaview.exe            # 写入图标 + 版本信息
+./target/release/embed-icon.exe --verify target/release/dadaview.exe   # 验证图标资源可加载
 ```
+
+版本号由 `embed-icon` 从根 `Cargo.toml` 读取，因此升版本只需改那一处。手写 `VS_VERSIONINFO` 时注意：所有子块的 **padding 是相对整个块起始**（含 6 字节块头）对齐到 DWORD，漏算块头会让 Windows 完全读不到版本资源。
 
 窗口标题栏 / 任务栏图标则编译期内嵌（`src/main.rs` 的 `include_bytes!("../assets/dadaview-512.png")`），免安装版无需附带 assets 目录。
 
-安装包用 WiX Toolset v5 生成（`dotnet tool install --global wix --version 5.0.2`），脚本在 [installer/dadaview.wxs](installer/dadaview.wxs)，MSI 内含 `ARPPRODUCTICON`（“应用和功能”图标）：
+安装器为纯 exe 方案（源码 `installer/launcher` + `installer/uninstaller`），不依赖 Windows Installer——部分系统上 msiexec 会报 2502/2503，纯 exe 彻底规避该类错误。
+
+安装器自带 Win32 原生向导（无额外 GUI 依赖）：欢迎 → 许可协议（中文导读 + `LICENSE` 英文原文，需勾选接受）→ 选择安装目录（可浏览更改，显示所需空间）→ 安装进度（进度条 + 当前文件 + 百分比）→ 完成（可勾选立即运行）。安装动作在后台线程执行，主线程靠消息泵保持界面刷新；安装期间禁用按钮并拦截关闭，避免半途退出。进程声明 Per-Monitor V2 DPI 感知，按系统 DPI 缩放窗口与字体。
+
+安装前会调用 `detect_installed()` 扫描 `Uninstall` 根键：既认本安装器写入的 `DaDaView` 条目，也认旧 MSI 版留下的 `{GUID}` 条目（`DisplayName == DaDaView` 且 `UninstallString` 含 `msiexec`），后者可在向导中一键清除注册表记录。
+
+安装器直接释放 payload、创建快捷方式（IShellLink）并写入「应用和功能」注册表项；payload 由 `build.rs` 在构建期打成 deflate zip 内嵌（`OUT_DIR/payload.zip`），因此**构建顺序不能乱**——主程序与卸载器必须先构建：
 
 ```bash
-wix build -arch x64 -ext WixToolset.UI.wixext -b . -out dist/DaDaView-0.1.0-x64-setup.msi installer/dadaview.wxs
-```
+# 1. 卸载器（会被安装器复制到安装目录，由「应用和功能」调用）
+cargo build --release --manifest-path installer/uninstaller/Cargo.toml
 
-安装版启动器在 [installer/launcher](installer/launcher)，通过 `include_bytes!` 把上面的 MSI 内嵌进 exe 并自动请求管理员权限，因此必须在 MSI 生成后再编译；编译完成后同样需要嵌入图标：
+# 2. 主程序 + 图标
+cargo build --release
+./target/release/embed-icon.exe target/release/dadaview.exe
 
-```bash
+# 3. 安装器（build.rs 自动打包 payload.zip 并内嵌）
 cargo build --release --manifest-path installer/launcher/Cargo.toml
 ./target/release/embed-icon.exe installer/launcher/target/release/dadaview-setup.exe
 cp installer/launcher/target/release/dadaview-setup.exe dist/DaDaView-0.1.0-x64-setup.exe
 ```
+
+卸载流程：`dadaview-uninstall.exe` 删除快捷方式、卸载注册表项后，以隐藏 cmd 延迟移除整个安装目录。安装器的 payload 解压完整性有单元测试保障（`cargo test --manifest-path installer/launcher/Cargo.toml`）。
+
+> 历史上的 WiX/MSI 管线（`installer/dadaview.wxs`）已停用，文件保留作参考；重新启用需自行恢复 README 旧版说明。
 
 ## 测试 · Tests
 
