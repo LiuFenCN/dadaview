@@ -10,6 +10,9 @@
 
     <SummaryInformation Description="DaDaView 图片查看器 + 3D 模型预览" />
 
+    <Icon Id="DaDaViewIcon" SourceFile="assets\dadaview.ico" />
+    <Property Id="ARPPRODUCTICON" Value="DaDaViewIcon" />
+
     <MajorUpgrade AllowSameVersionUpgrades="yes"
                   DowngradeErrorMessage="已安装更新版本的 DaDaView，请先在“应用和功能”中卸载。 / A newer version of DaDaView is already installed." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
