@@ -3537,6 +3537,26 @@ impl eframe::App for DaDaViewApp {
     }
 }
 
+/// 窗口图标：编译期内嵌 assets/dadaview-512.png（免安装版无 assets 目录也能用）
+fn window_icon() -> std::sync::Arc<egui::IconData> {
+    const ICON_PNG: &[u8] = include_bytes!("../assets/dadaview-512.png");
+    if let Ok(img) = image::load_from_memory(ICON_PNG) {
+        let rgba = img.to_rgba8();
+        let (width, height) = (rgba.width(), rgba.height());
+        return std::sync::Arc::new(egui::IconData {
+            rgba: rgba.into_raw(),
+            width,
+            height,
+        });
+    }
+    // 兜底：8x8 中性灰（编译期内嵌的 PNG 解码失败时理论上到不了这里）
+    std::sync::Arc::new(egui::IconData {
+        rgba: vec![128; 8 * 8 * 4],
+        width: 8,
+        height: 8,
+    })
+}
+
 fn main() -> eframe::Result<()> {
     // 解析命令行参数：第一个非程序名参数作为图片路径
 
@@ -3554,7 +3574,8 @@ fn main() -> eframe::Result<()> {
             .with_title("DaDaView")
             .with_decorations(false)
             .with_transparent(true)
-            .with_resizable(true),
+            .with_resizable(true)
+            .with_icon(window_icon()),
 
         ..Default::default()
     };
