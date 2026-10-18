@@ -43,17 +43,27 @@
 cargo build --release
 ```
 
-产物为 `target/release/dadaview.exe`。安装包用 WiX Toolset 3.11 生成，脚本在 [installer/dadaview.wxs](installer/dadaview.wxs)：
+产物为 `target/release/dadaview.exe`。图标资源（`assets/dadaview.ico`）不进二进制源码，由 `embed-icon` 工具在编译后写入 exe（走 kernel32 资源更新 API，无需 rc.exe / windres）：
 
 ```bash
-candle.exe -arch x64 -out installer/obj/dadaview.wixobj installer/dadaview.wxs
-light.exe -ext WixUIExtension -cultures:zh-CN -out dist/DaDaView-0.1.0-x64-setup.msi installer/obj/dadaview.wixobj
+cargo build --release
+./target/release/embed-icon.exe target/release/dadaview.exe            # 嵌入图标
+./target/release/embed-icon.exe --verify target/release/dadaview.exe   # 验证资源可加载
 ```
 
-安装版启动器在 [installer/launcher](installer/launcher)，会把上面的 MSI 内嵌进 exe 并自动请求管理员权限，因此必须在 MSI 生成后再编译：
+窗口标题栏 / 任务栏图标则编译期内嵌（`src/main.rs` 的 `include_bytes!("../assets/dadaview-512.png")`），免安装版无需附带 assets 目录。
+
+安装包用 WiX Toolset v5 生成（`dotnet tool install --global wix --version 5.0.2`），脚本在 [installer/dadaview.wxs](installer/dadaview.wxs)，MSI 内含 `ARPPRODUCTICON`（“应用和功能”图标）：
+
+```bash
+wix build -arch x64 -ext WixToolset.UI.wixext -b . -out dist/DaDaView-0.1.0-x64-setup.msi installer/dadaview.wxs
+```
+
+安装版启动器在 [installer/launcher](installer/launcher)，通过 `include_bytes!` 把上面的 MSI 内嵌进 exe 并自动请求管理员权限，因此必须在 MSI 生成后再编译；编译完成后同样需要嵌入图标：
 
 ```bash
 cargo build --release --manifest-path installer/launcher/Cargo.toml
+./target/release/embed-icon.exe installer/launcher/target/release/dadaview-setup.exe
 cp installer/launcher/target/release/dadaview-setup.exe dist/DaDaView-0.1.0-x64-setup.exe
 ```
 
