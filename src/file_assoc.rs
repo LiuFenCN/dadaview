@@ -452,7 +452,7 @@ impl UserChoiceCtx {
 ///
 /// 要点：regdate 必须是键的真实写入时间（分钟截断）。写入 Hash 会刷新键时间戳，
 /// 因此写完后读回校验，跨分钟边界时重试（最多 3 次）。
-fn set_user_choice(ext: &str, ctx: &UserChoiceCtx) -> Result<(), String> {
+fn set_user_choice(ext: &str, ctx: &UserChoiceCtx, prog_id: &str) -> Result<(), String> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let path = format!(
         "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\.{ext}\\UserChoice"
@@ -464,7 +464,7 @@ fn set_user_choice(ext: &str, ctx: &UserChoiceCtx) -> Result<(), String> {
         let (key, _) = hkcu
             .create_subkey(&path)
             .map_err(|e| format!("创建 UserChoice 键失败: {e}"))?;
-        key.set_value("ProgId", &PROG_ID)
+        key.set_value("ProgId", &prog_id)
             .map_err(|e| format!("写入 ProgId 失败: {e}"))?;
 
         let ft = key_last_write_time(&path).unwrap_or_else(now_filetime);
@@ -472,7 +472,7 @@ fn set_user_choice(ext: &str, ctx: &UserChoiceCtx) -> Result<(), String> {
         let hash = user_choice_hash(
             &format!(".{ext}"),
             &ctx.sid,
-            PROG_ID,
+            prog_id,
             &regdate,
             &ctx.experience,
         );
@@ -490,6 +490,55 @@ fn set_user_choice(ext: &str, ctx: &UserChoiceCtx) -> Result<(), String> {
 }
 
 // ─── 注册表文件关联 ───────────────────────────────────────
+
+/// 每个扩展名一个专属 ProgID（`DaDaView.<ext>`），从而每种格式能有自己的
+/// DefaultIcon（指向 exe 内嵌的对应文档图标资源）与 FriendlyTypeName。
+fn per_ext_prog_id(ext: &str) -> String {
+    format!("DaDaView.{}", ext)
+}
+
+/// 注册（或修正）单个扩展名的专属 ProgID：command 指向当前 exe、
+/// DefaultIcon 指向该格式的文档图标资源、FriendlyTypeName 带格式名。
+fn register_per_ext_progid(
+    hkcu: &RegKey,
+    ext: &str,
+    exe_str: &str,
+) -> Result<(), String> {
+    let prog_id = per_ext_prog_id(ext);
+
+    let (prog_key, _) = hkcu
+        .create_subkey(format!("SOFTWARE\\Classes\\{}", prog_id))
+        .map_err(|e| format!("创建 ProgID {} 失败: {}", prog_id, e))?;
+
+    let friendly = format!(
+        "{} 文件 (DaDaView)",
+        crate::ext_icons::ext_category(ext).trim_end_matches("文件")
+    );
+    prog_key
+        .set_value("", &friendly)
+        .map_err(|e| e.to_string())?;
+    prog_key
+        .set_value("FriendlyTypeName", &friendly)
+        .map_err(|e| e.to_string())?;
+
+    let (shell_key, _) = prog_key
+        .create_subkey("shell\\open\\command")
+        .map_err(|e| format!("创建 command 失败: {}", e))?;
+    shell_key
+        .set_value("", &format!("\"{}\" \"%1\"", exe_str))
+        .map_err(|e| e.to_string())?;
+
+    let (icon_key, _) = prog_key
+        .create_subkey("DefaultIcon")
+        .map_err(|e| format!("创建 DefaultIcon 失败: {}", e))?;
+    // Explorer 图标序号：0 = 应用图标，1.. = 各格式文档图标（见 ext_icons.rs）
+    let icon_index = crate::ext_icons::doc_icon_shell_index(ext).unwrap_or(0);
+    icon_key
+        .set_value("", &format!("\"{}\",{}", exe_str, icon_index))
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
 
 /// 注册文件关联到 Windows 注册表（仅 HKCU）
 pub(crate) fn register_file_association(exts: &[String], set_default: bool) -> Result<(), String> {
@@ -510,7 +559,7 @@ pub(crate) fn register_file_association(exts: &[String], set_default: bool) -> R
         None
     };
 
-    // 注册 ProgID
+    // 通用 ProgID（DaDaView.Image）：保留——「打开方式」列表与旧关联的兼容项
 
     let prog_id = PROG_ID;
 
@@ -567,26 +616,34 @@ pub(crate) fn register_file_association(exts: &[String], set_default: bool) -> R
     // 关联各扩展名
 
     for ext in exts {
+        // 每个扩展名一个专属 ProgID，携带该格式自己的文档图标
+        register_per_ext_progid(&hkcu, ext, exe_str)?;
+
+        let ext_prog_id = per_ext_prog_id(ext);
+
         let ext_key_name = format!("SOFTWARE\\Classes\\.{}", ext);
 
         let (ext_key, _) = hkcu
             .create_subkey(&ext_key_name)
             .map_err(|e| format!("创建 .{} 键失败: {}", ext, e))?;
 
-        // OpenWithProgids — 出现在"打开方式"列表
+        // OpenWithProgids — 出现在"打开方式"列表（专属 + 通用都列上）
 
         let (open_with, _) = ext_key
             .create_subkey("OpenWithProgids")
             .map_err(|e| format!("创建 OpenWithProgids 失败: {}", e))?;
 
         open_with
+            .set_value(&ext_prog_id, &"")
+            .map_err(|e| e.to_string())?;
+        open_with
             .set_value(prog_id, &"")
             .map_err(|e| e.to_string())?;
 
         if set_default {
-            // 设置默认值 — 在 HKCU\SOFTWARE\Classes 下设置
+            // 设置默认值 — 在 HKCU\SOFTWARE\Classes 下设置（指向专属 ProgID）
 
-            ext_key.set_value("", &prog_id).map_err(|e| e.to_string())?;
+            ext_key.set_value("", &ext_prog_id).map_err(|e| e.to_string())?;
 
             // 同时写入 FileExts 以增强兼容性
 
@@ -609,6 +666,7 @@ pub(crate) fn register_file_association(exts: &[String], set_default: bool) -> R
                 // 写入 ProgID 到 OpenWithProgids
 
                 if let Ok((owp_key, _)) = fe_key.create_subkey("OpenWithProgids") {
+                    let _ = owp_key.set_value(&ext_prog_id, &0u32);
                     let _ = owp_key.set_value(prog_id, &0u32);
                 }
             }
@@ -616,7 +674,7 @@ pub(crate) fn register_file_association(exts: &[String], set_default: bool) -> R
             // 关键：写 UserChoice（ProgId + 合法 Hash），否则 Windows 8+ 不认 Classes 默认值
 
             if let Some(ctx) = &user_ctx
-                && let Err(e) = set_user_choice(ext, ctx)
+                && let Err(e) = set_user_choice(ext, ctx, &ext_prog_id)
             {
                 uc_failures.push(format!(".{}: {}", ext, e));
             }
@@ -680,6 +738,73 @@ pub(crate) fn register_file_association(exts: &[String], set_default: bool) -> R
     }
 
     Ok(())
+}
+
+/// 启动时的静默迁移：把仍指向通用 ProgID（`DaDaView.Image`）的旧关联
+/// 切换到每扩展名专属 ProgID，让各格式立刻获得自己的文档图标。
+///
+/// 只在「当前默认仍是我们旧的通用 ProgID」时才改写——用户后来手动改成了
+/// 其它程序的关联则完全不动。已指向专属 ProgID 的也跳过（幂等）。
+/// 每次启动都调用是安全的：注册 ProgID 键是幂等覆盖，UserChoice 仅在
+/// 命中旧值时重写一次。
+pub(crate) fn migrate_legacy_progids(exts: &[String]) {
+    use winreg::enums::*;
+
+    use winreg::RegKey;
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+
+    let exe_str = match std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(|s| s.to_string()))
+    {
+        Some(s) => s,
+        None => return,
+    };
+
+    let mut changed = false;
+
+    for ext in exts {
+        // 1) 确保专属 ProgID 存在（幂等）
+        if register_per_ext_progid(&hkcu, ext, &exe_str).is_err() {
+            continue;
+        }
+        let ext_prog_id = per_ext_prog_id(ext);
+
+        // 2) HKCU\.\ext 默认值若还是通用 ProgID → 换成专属
+        if let Ok(k) = hkcu.open_subkey_with_flags(format!("SOFTWARE\\Classes\\.{}", ext), KEY_READ)
+            && k.get_value::<String, _>("").ok().as_deref() == Some(PROG_ID)
+        {
+            if let Ok((k2, _)) = hkcu.create_subkey(format!("SOFTWARE\\Classes\\.{}", ext)) {
+                let _ = k2.set_value("", &ext_prog_id);
+                changed = true;
+            }
+        }
+
+        // 3) UserChoice 若还是通用 ProgID → 用合法 Hash 重写为专属 ProgID
+        let uc_path = format!(
+            "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\.{}\\UserChoice",
+            ext
+        );
+        let current = hkcu
+            .open_subkey_with_flags(&uc_path, KEY_READ)
+            .and_then(|k| k.get_value::<String, _>("ProgId"));
+        if current.ok().as_deref() == Some(PROG_ID)
+            && let Ok(ctx) = UserChoiceCtx::fetch()
+            && set_user_choice(ext, &ctx, &ext_prog_id).is_ok()
+        {
+            changed = true;
+        }
+    }
+
+    if changed {
+        // 通知 shell 刷新图标缓存
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify};
+            SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -761,7 +886,8 @@ mod tests {
     fn set_user_choice_smoke() {
         let ctx = UserChoiceCtx::fetch().expect("用户上下文");
         let ext = "vtk";
-        set_user_choice(ext, &ctx).expect("set_user_choice");
+        let prog_id = per_ext_prog_id(ext);
+        set_user_choice(ext, &ctx, &prog_id).expect("set_user_choice");
 
         let path = format!(
             "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\.{ext}\\UserChoice"
@@ -770,14 +896,14 @@ mod tests {
         let key = hkcu.open_subkey(&path).expect("打开 UserChoice 键");
         let prog: String = key.get_value("ProgId").expect("读 ProgId");
         let hash: String = key.get_value("Hash").expect("读 Hash");
-        assert_eq!(prog, PROG_ID);
+        assert_eq!(prog, prog_id);
         assert!(!hash.is_empty());
 
         let ft = key_last_write_time(&path).expect("读键时间戳");
         let expect = user_choice_hash(
             &format!(".{ext}"),
             &ctx.sid,
-            PROG_ID,
+            &prog_id,
             &filetime_hex_minute(ft),
             &ctx.experience,
         );

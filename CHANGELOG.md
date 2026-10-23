@@ -2,6 +2,22 @@
 
 本项目的所有重要变更记录。版本号遵循 `主.次.修订`。
 
+## [未发布] - 2026-10-23
+
+### 新增
+
+- **每格式专属文档图标**（此前所有关联格式在无缩略图时一律显示软件图标，无法区分文件类型）
+  - `assets/ext-icons/`：33 个格式文档图标（`gen_icons.py` 程序化生成，4x 超采样）——白色文档纸 + 类别色折角 + 色带上印格式名；粉=图像、蓝=3D 模型、绿=3D 打印
+  - 嵌入 dadaview.exe（资源 ID 2 起），`DefaultIcon` 按 Explorer 图标序号指向对应图标；应用图标（快捷方式/任务栏）不受影响
+  - 文件关联改为**每格式一个 ProgID**（`DaDaView.<ext>`），各自的 FriendlyTypeName 带格式名（如「PNG 图像 文件 (DaDaView)」）
+  - 清单唯一权威定义在 `src/ext_icons.rs`（`SUPPORTED_EXTS` 与文档图标清单同源；新增格式 = 改一处 + 重跑 `gen_icons.py` + 重新嵌入）
+  - 程序启动时静默迁移仍指向旧通用 ProgID（`DaDaView.Image`）的关联——只改写仍是我们旧值的键，用户后来手动改成其它程序的关联不动，幂等可重复
+  - 注意：文档图标只对「DaDaView 为默认打开方式」的格式生效；有缩略图时资源管理器仍显示缩略图
+
+### 修复
+
+- **构建流水线漏构建 embed-icon 自身**：`--doc-icons` 传给旧版 embed-icon 时会把 `--doc-icons` 当 exe 路径、把 dadaview.exe 当 ICO 解析，报「不是合法的 ICO 文件」且极具迷惑性。README 构建顺序已补上 `cargo build --release --bin embed-icon` 第 0 步
+
 ## [未发布] - 2026-10-19
 
 ### 新增

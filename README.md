@@ -48,13 +48,20 @@
 cargo build --release
 ```
 
-产物为 `target/release/dadaview.exe`。图标资源（`assets/dadaview.ico`）与版本信息（VERSIONINFO）都不进二进制源码，由 `embed-icon` 工具在编译后写入 exe（走 kernel32 资源更新 API，无需 rc.exe / windres / winres）：
+产物为 `target/release/dadaview.exe`。图标资源与版本信息（VERSIONINFO）都不进二进制源码，由 `embed-icon` 工具在编译后写入 exe（走 kernel32 资源更新 API，无需 rc.exe / windres / winres）：
 
 ```bash
-cargo build --release
-./target/release/embed-icon.exe target/release/dadaview.exe            # 写入图标 + 版本信息
-./target/release/embed-icon.exe --verify target/release/dadaview.exe   # 验证图标资源可加载
+cargo build --release --bin embed-icon                                 # embed-icon 自身也要最新
+./target/release/embed-icon.exe --doc-icons target/release/dadaview.exe  # 应用图标 + 各格式文档图标 + 版本信息
+./target/release/embed-icon.exe --verify target/release/dadaview.exe     # 验证图标资源可加载
 ```
+
+图标分两层，均嵌在 dadaview.exe 内：
+
+- **应用图标**（`assets/dadaview.ico`，资源 ID 1）——快捷方式 / 任务栏用
+- **格式文档图标**（`assets/ext-icons/<ext>.ico`，33 个，由 `gen_icons.py` 生成，资源 ID 2 起）——文件**无缩略图时**的兜底图标，白纸 + 折角 + 色带上印格式名（PNG / GLB / OBJ…），粉=图像、蓝=模型、绿=3D 打印
+
+文件关联随之按**每格式一个 ProgID**（`DaDaView.<ext>`）注册，`DefaultIcon` 指向各自的文档图标序号；清单一律以 `src/ext_icons.rs` 为准（`SUPPORTED_EXTS` 与 `DOC_ICON_EXTS` 同源，改格式只动一处 + 重跑 `gen_icons.py`）。程序启动时会静默迁移仍指向旧通用 ProgID（`DaDaView.Image`）的关联，用户无需手动重设。注意：文档图标只对「DaDaView 是默认打开方式」的格式生效；有缩略图时资源管理器仍显示缩略图。
 
 版本号由 `embed-icon` 从根 `Cargo.toml` 读取，因此升版本只需改那一处。手写 `VS_VERSIONINFO` 时注意：所有子块的 **padding 是相对整个块起始**（含 6 字节块头）对齐到 DWORD，漏算块头会让 Windows 完全读不到版本资源。
 
@@ -69,12 +76,15 @@ cargo build --release
 安装器直接释放 payload、创建快捷方式（IShellLink）并写入「应用和功能」注册表项；payload 由 `build.rs` 在构建期打成 deflate zip 内嵌（`OUT_DIR/payload.zip`），因此**构建顺序不能乱**——主程序与卸载器必须先构建：
 
 ```bash
+# 0. embed-icon（先构建自身，避免把 --doc-icons 当路径解析）
+cargo build --release --bin embed-icon
+
 # 1. 卸载器（会被安装器复制到安装目录，由「应用和功能」调用）
 cargo build --release --manifest-path installer/uninstaller/Cargo.toml
 
-# 2. 主程序 + 图标
+# 2. 主程序 + 图标（--doc-icons 嵌入 33 个格式文档图标）
 cargo build --release
-./target/release/embed-icon.exe target/release/dadaview.exe
+./target/release/embed-icon.exe --doc-icons target/release/dadaview.exe
 
 # 3. 安装器（build.rs 自动打包 payload.zip 并内嵌）
 cargo build --release --manifest-path installer/launcher/Cargo.toml

@@ -1,14 +1,25 @@
 //! embed-icon — 把多尺寸 .ico 与 VERSIONINFO 写入 Windows PE 资源段。
 //!
 //! 用法：
-//!   embed-icon.exe <exe路径> [ico路径]   嵌入图标 + 版本信息（缺省 ico：assets/dadaview.ico）
-//!   embed-icon.exe --verify <exe路径>    加载 exe 中的图标组 #1 验证资源有效性
+//!   embed-icon.exe <exe路径> [ico路径]              嵌入应用图标 + 版本信息（缺省 ico：assets/dadaview.ico）
+//!   embed-icon.exe <exe路径> [ico路径] --doc-icons  额外嵌入 assets/ext-icons/ 的各格式文档图标
+//!   embed-icon.exe --verify <exe路径>               加载 exe 中的图标组 #1 验证资源有效性
+//!
+//! 资源布局（见 src/ext_icons.rs）：
+//!   RT_GROUP_ICON ID 1          = 应用图标（Explorer 序号 0）
+//!   RT_GROUP_ICON ID 2 + ordinal = 各格式文档图标（Explorer 序号 = 1 + ordinal）
+//!   RT_ICON 图像 ID：应用图标从 1 递增，文档图标从 200 递增（每张图一个全局唯一 ID）
 //!
 //! 实现走 kernel32 的 BeginUpdateResourceW / UpdateResourceW / EndUpdateResourceW，
 //! 不依赖 rc.exe / windres / winres，任何 Rust 工具链都能构建。
 //!
 //! 版本号从根 Cargo.toml 的 `version` 读取，因此发版只需改那一处，
 //! exe 属性页里的「文件版本 / 产品版本」会自动跟着变。
+
+// 部分辅助函数只被主程序使用，此处嵌入同一模块会报 dead_code
+#[allow(unused)]
+#[path = "../ext_icons.rs"]
+mod ext_icons;
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
@@ -26,6 +37,8 @@ const RT_ICON: u16 = 3;
 const RT_GROUP_ICON: u16 = 14;
 const RT_VERSION: u16 = 16;
 const LANG_EN_US: u16 = 1033;
+/// 文档图标 RT_ICON 图像数据的起始资源 ID（与应用图标的图像 ID 区隔开）
+const DOC_IMAGE_BASE_ID: u16 = 200;
 /// GDI_IMAGE_TYPE: 0=BITMAP, 1=ICON, 2=CURSOR
 const IMAGE_ICON_TYPE: GDI_IMAGE_TYPE = GDI_IMAGE_TYPE(1);
 
@@ -203,16 +216,13 @@ fn read_cargo_version() -> Result<String, String> {
         .ok_or_else(|| "Cargo.toml 中未找到 version".to_string())
 }
 
-fn embed(exe: &str, ico: &str) -> Result<(), String> {
-    let ico_bytes = std::fs::read(ico).map_err(|e| format!("读取 {} 失败: {}", ico, e))?;
-    let images = parse_ico(&ico_bytes)?;
-    let version = read_cargo_version()?;
-
-    let exe_w = wide(exe);
-    // false = 不清除既有资源（增量更新）
-    let h: HANDLE = unsafe { BeginUpdateResourceW(PCWSTR(exe_w.as_ptr()), false) }
-        .map_err(|e| format!("BeginUpdateResourceW 失败（文件被占用?）: {}", e))?;
-
+/// 写入一个图标组：组资源 ID = `group_id`，组内各图像资源 ID 从 `first_image_id` 递增
+fn write_icon_group(
+    h: HANDLE,
+    group_id: u16,
+    images: &[IcoImage],
+    first_image_id: u16,
+) -> Result<(), String> {
     // GRPICONDIR：头 + 每张图的目录项
     let mut grp: Vec<u8> = Vec::new();
     grp.extend_from_slice(&0u16.to_le_bytes()); // reserved
@@ -220,7 +230,7 @@ fn embed(exe: &str, ico: &str) -> Result<(), String> {
     grp.extend_from_slice(&(images.len() as u16).to_le_bytes());
 
     for (i, img) in images.iter().enumerate() {
-        let id = (i + 1) as u16;
+        let id = first_image_id + i as u16;
         unsafe {
             UpdateResourceW(
                 h,
@@ -247,13 +257,52 @@ fn embed(exe: &str, ico: &str) -> Result<(), String> {
         UpdateResourceW(
             h,
             intres(RT_GROUP_ICON),
-            intres(1),
+            intres(group_id),
             LANG_EN_US,
             Some(grp.as_ptr() as *const _),
             grp.len() as u32,
         )
     }
-    .map_err(|e| format!("写入 RT_GROUP_ICON 失败: {}", e))?;
+    .map_err(|e| format!("写入 RT_GROUP_ICON #{} 失败: {}", group_id, e))?;
+    Ok(())
+}
+
+/// 从 assets/ext-icons/ 读入全部文档图标，按 ext_icons::DOC_ICON_EXTS 顺序返回
+fn load_doc_icons(dir: &str) -> Result<Vec<(u16, Vec<IcoImage>)>, String> {
+    let mut out = Vec::new();
+    for ext in ext_icons::DOC_ICON_EXTS {
+        let path = format!("{}/{}.ico", dir.trim_end_matches('/'), ext);
+        let bytes = std::fs::read(&path).map_err(|e| format!("读取 {} 失败: {}", path, e))?;
+        out.push((ext_icons::doc_icon_resource_id(ext).unwrap(), parse_ico(&bytes)?));
+    }
+    Ok(out)
+}
+
+fn embed(exe: &str, ico: &str, doc_icons: bool) -> Result<(), String> {
+    let ico_bytes = std::fs::read(ico).map_err(|e| format!("读取 {} 失败: {}", ico, e))?;
+    let images = parse_ico(&ico_bytes)?;
+    let version = read_cargo_version()?;
+
+    // 文档图标源目录（与应用图标同源仓库布局）
+    let doc_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/ext-icons");
+    let doc = if doc_icons { Some(load_doc_icons(doc_dir)?) } else { None };
+
+    let exe_w = wide(exe);
+    // false = 不清除既有资源（增量更新）
+    let h: HANDLE = unsafe { BeginUpdateResourceW(PCWSTR(exe_w.as_ptr()), false) }
+        .map_err(|e| format!("BeginUpdateResourceW 失败（文件被占用?）: {}", e))?;
+
+    // 应用图标：组 ID 1，图像 ID 从 1 递增
+    write_icon_group(h, ext_icons::APP_ICON_ID, &images, 1)?;
+
+    // 各格式文档图标：组 ID = 2 + ordinal，图像 ID 从 200 递增
+    if let Some(doc) = &doc {
+        let mut img_id = DOC_IMAGE_BASE_ID;
+        for (group_id, imgs) in doc {
+            write_icon_group(h, *group_id, imgs, img_id)?;
+            img_id += imgs.len() as u16;
+        }
+    }
 
     // VERSIONINFO：属性页里的「文件版本 / 产品版本 / 描述 / 版权」
     let file_name = std::path::Path::new(exe)
@@ -283,13 +332,22 @@ fn embed(exe: &str, ico: &str) -> Result<(), String> {
         .iter()
         .map(|im| if im.dim == 0 { "256".into() } else { im.dim.to_string() })
         .collect();
-    println!(
-        "已嵌入 {} 张图标（{} px）+ 版本信息 {} -> {}",
-        images.len(),
-        dims.join(" / "),
-        version,
-        exe
-    );
+    match &doc {
+        Some(doc) => println!(
+            "已嵌入应用图标（{} px）+ {} 个格式文档图标 + 版本信息 {} -> {}",
+            dims.join(" / "),
+            doc.len(),
+            version,
+            exe
+        ),
+        None => println!(
+            "已嵌入 {} 张图标（{} px）+ 版本信息 {} -> {}",
+            images.len(),
+            dims.join(" / "),
+            version,
+            exe
+        ),
+    }
     Ok(())
 }
 
@@ -297,30 +355,40 @@ fn verify(exe: &str) -> Result<(), String> {
     let exe_w = wide(exe);
     let hmod = unsafe { LoadLibraryExW(PCWSTR(exe_w.as_ptr()), None, LOAD_LIBRARY_AS_DATAFILE) }
         .map_err(|e| format!("LoadLibraryExW 失败: {}", e))?;
-    let loaded = unsafe {
-        LoadImageW(
-            hmod,
-            intres(1),
-            IMAGE_ICON_TYPE,
-            256,
-            256,
-            IMAGE_FLAGS(0),
-        )
-    };
-    let ok = match loaded {
-        Ok(g) if !g.is_invalid() => {
-            println!("OK: {} 含有效图标组 #1（256x256 可加载）", exe);
-            true
-        }
-        _ => {
-            println!("FAIL: {} 中未找到可加载的图标组 #1", exe);
-            false
+    let load_icon = |group_id: u16| -> bool {
+        match unsafe { LoadImageW(hmod, intres(group_id), IMAGE_ICON_TYPE, 256, 256, IMAGE_FLAGS(0)) } {
+            Ok(g) => !g.is_invalid(),
+            Err(_) => false,
         }
     };
-    if ok {
+
+    let app_ok = load_icon(ext_icons::APP_ICON_ID);
+    println!(
+        "应用图标组 #{}: {}",
+        ext_icons::APP_ICON_ID,
+        if app_ok { "OK（256x256 可加载）" } else { "FAIL" }
+    );
+
+    // 文档图标组（若嵌入过）：抽查第一个和最后一个
+    let doc_first = ext_icons::DOC_ICON_BASE_ID;
+    let doc_last =
+        ext_icons::DOC_ICON_BASE_ID + ext_icons::DOC_ICON_EXTS.len() as u16 - 1;
+    let first_ok = load_icon(doc_first);
+    let last_ok = load_icon(doc_last);
+    println!(
+        "文档图标组 #{}（{}）: {}；#{}（{}）: {}",
+        doc_first,
+        ext_icons::DOC_ICON_EXTS[0],
+        if first_ok { "OK" } else { "无 / FAIL" },
+        doc_last,
+        ext_icons::DOC_ICON_EXTS[ext_icons::DOC_ICON_EXTS.len() - 1],
+        if last_ok { "OK" } else { "无 / FAIL" }
+    );
+
+    if app_ok {
         Ok(())
     } else {
-        Err("图标资源缺失".into())
+        Err("应用图标资源缺失".into())
     }
 }
 
@@ -328,12 +396,21 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let default_ico = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/dadaview.ico").to_string();
 
-    let result = match args.iter().map(|s| s.as_str()).collect::<Vec<_>>().as_slice() {
-        [_ , "--verify", exe] => verify(exe),
-        [_ , exe] => embed(exe, &default_ico),
-        [_ , exe, ico] => embed(exe, ico),
+    let doc_icons = args.iter().any(|a| a == "--doc-icons");
+    let positional: Vec<&String> = args
+        .iter()
+        .skip(1)
+        .filter(|a| !a.starts_with("--"))
+        .collect();
+
+    let result = match positional.as_slice() {
+        [exe] if args.iter().any(|a| a == "--verify") => verify(exe),
+        [exe] => embed(exe, &default_ico, doc_icons),
+        [exe, ico] => embed(exe, ico, doc_icons),
         _ => {
-            eprintln!("用法: embed-icon <exe路径> [ico路径] | embed-icon --verify <exe路径>");
+            eprintln!(
+                "用法: embed-icon <exe路径> [ico路径] [--doc-icons] | embed-icon --verify <exe路径>"
+            );
             std::process::exit(2);
         }
     };

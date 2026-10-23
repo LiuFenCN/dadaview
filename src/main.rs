@@ -2,6 +2,7 @@
 
 #![windows_subsystem = "windows"]
 
+mod ext_icons;
 mod file_assoc;
 mod gpu3d;
 mod imaging;
@@ -34,11 +35,8 @@ use settings::{
 };
 use win32::apply_win11_effects;
 
-const SUPPORTED_EXTS: &[&str] = &[
-    "png", "jpg", "jpeg", "bmp", "webp", "tiff", "tif", "gif", "ico", "obj", "stl", "gltf", "glb",
-    "ply", "off", "3ds", "dae", "vtk", "wrl", "vrml", "amf", "3mf", "gcode", "gco", "g", "vrm",
-    "fbx", "pmx", "pmd", "usd", "usda", "usdc", "usdz",
-];
+/// 支持的格式 = 文档图标清单（与 exe 内嵌图标一一对应，见 ext_icons）
+const SUPPORTED_EXTS: &[&str] = ext_icons::DOC_ICON_EXTS;
 
 /// 修改时间新→旧；同时间（含读不到的 i64::MIN）按名称兜底
 fn sort_by_mtime(keyed: &mut [(i64, PathBuf)]) {
@@ -3563,6 +3561,15 @@ fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     let initial_path: Option<PathBuf> = args.get(1).map(PathBuf::from);
+
+    // ── 旧关联静默迁移：把仍指向通用 ProgID 的关联切到每格式专属 ProgID，
+    //    让各格式显示自己的文档图标（幂等；只在命中旧值时改写）──
+    {
+        let associated: Vec<String> = AppSettings::load().associated_exts;
+        if !associated.is_empty() {
+            thread::spawn(move || file_assoc::migrate_legacy_progids(&associated));
+        }
+    }
 
     // ── 单实例检测：尝试连接已有管道 ──
 

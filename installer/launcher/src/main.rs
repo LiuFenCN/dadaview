@@ -1701,6 +1701,9 @@ unsafe fn run_install(w: *mut Wizard, dir: PathBuf) {
     set_page(&mut *w, Page::Progress);
 
     let handle = std::thread::spawn(move || {
+        // 本线程会通过 COM 创建快捷方式（IShellLink），必须先初始化 COM。
+        // 重复调用返回 S_FALSE，无害。
+        unsafe { let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED); };
         install_to(&dir, desktop, start_menu, leftover, &|name: &str, n: u64| {
             PROG_DONE.fetch_add(n, Ordering::SeqCst);
             if let Ok(mut f) = PROG_FILE.lock() {
