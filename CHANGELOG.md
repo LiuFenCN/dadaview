@@ -16,6 +16,11 @@
 
 ### 修复
 
+- **FBX 7.5+（≥7500）二进制文件一律报「未找到多边形网格」**
+  - 根因：二进制 FBX 的节点头在 7500 版起把 `EndOffset` / `NumProperties` / `PropertyListLen` 全部加宽到 64 位，解析器只对 `EndOffset` 按版本取宽，后两个字段仍按 32 位读——于是读到 `NumProperties` 的高 4 字节（恒为 0）当作 `PropertyListLen`，属性列表长度恒为 0，`Vertices` / `PolygonVertexIndex` 全部被跳过
+  - 影响：所有由 FBX SDK 2016 及以上导出的文件（7.5 / 7.7 等），例如 RE Engine 模型经 Noesis 工具导出的 `.fbx`
+  - 修复：新增 `FbxCur::count_field()`，按版本读 64/32 位；`fbx_looks_like_node()` 的节点头长度同步修正
+  - 回归：`load_fbx_binary_7500_u64_node_header` 用 7500 / 7700 两种版本覆盖；真实文件实测 29757 顶点 / 9919 三角形，与独立解析结果（7393 顶点、29757 个多边形角、9919 个三角面）一致
 - **构建流水线漏构建 embed-icon 自身**：`--doc-icons` 传给旧版 embed-icon 时会把 `--doc-icons` 当 exe 路径、把 dadaview.exe 当 ICO 解析，报「不是合法的 ICO 文件」且极具迷惑性。README 构建顺序已补上 `cargo build --release --bin embed-icon` 第 0 步
 
 ## [未发布] - 2026-10-19

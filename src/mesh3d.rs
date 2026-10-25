@@ -2317,6 +2317,17 @@ impl<'a> FbxCur<'a> {
         if self.ver >= 7500 { 8 } else { 4 }
     }
 
+    /// 节点头里的 NumProperties / PropertyListLen：FBX ≥7500 是 64 位，之前是 32 位。
+    /// 按 32 位读会把前一个字段的高 4 字节（恒 0）当成后一个字段，
+    /// 于是 PropertyListLen 变成 0、属性全被跳过（7.5+ 文件因此「找不到网格」）。
+    fn count_field(&mut self) -> Option<u64> {
+        if self.ver >= 7500 {
+            self.u64()
+        } else {
+            self.u32().map(u64::from)
+        }
+    }
+
     fn read_property(&mut self) -> Option<FbxProp> {
         let t = self.u8()?;
         match t {
@@ -2429,8 +2440,8 @@ impl<'a> FbxCur<'a> {
 /// 解析一个节点：返回（名字、属性、子节点起始位置）
 fn fbx_read_node(c: &mut FbxCur, end: usize) -> Option<(String, Vec<FbxProp>, usize)> {
     let node_end = c.off()?;
-    let _num_props = c.u32()?;
-    let prop_list_len = c.u32()? as usize;
+    let _num_props = c.count_field()?;
+    let prop_list_len = c.count_field()? as usize;
     let name_len = c.u8()? as usize;
     if node_end <= c.p || node_end > end {
         return None;
@@ -2739,13 +2750,17 @@ fn fbx_looks_like_node(c: &FbxCur, p: usize) -> bool {
         ver: c.ver,
     };
     let sz = t.off_size();
-    let (Some(e), Some(np), Some(pl), Some(nl)) = (t.off(), t.u32(), t.u32(), t.u8()) else {
+    // 节点头固定部分：偏移 + NumProperties + PropertyListLen + NameLen
+    let hdr = if t.ver >= 7500 { 8 + 8 + 8 + 1 } else { 4 + 4 + 4 + 1 };
+    let (Some(e), Some(np), Some(pl), Some(nl)) =
+        (t.off(), t.count_field(), t.count_field(), t.u8())
+    else {
         return false;
     };
-    let body = p + sz + 9;
+    let body = p + hdr;
     let nl = nl as usize;
     // 记录内容 = 名字 + 属性列表 + 至少一条子节点结束空记录
-    if e < body + nl + pl as usize + sz + 9 || e > c.d.len() || np > 1000 {
+    if e < body + nl + pl as usize + sz + hdr || e > c.d.len() || np > 1000 {
         return false;
     }
     // 无名记录只能是根节点：根节点不带属性
@@ -3995,6 +4010,12 @@ mod tests {
 
     /// 写一条节点记录：base 是它在整个文件里的起始偏移
     fn node(s: &Spec, base: usize) -> Vec<u8> {
+        node_v(s, base, 7400)
+    }
+
+    /// 同上，但按版本决定节点头宽：FBX ≥7500 的偏移/计数/属性长度都是 64 位
+    fn node_v(s: &Spec, base: usize, ver: u32) -> Vec<u8> {
+        let wide = ver >= 7500;
         let mut blob = Vec::new();
         for p in &s.props {
             blob.extend_from_slice(p);
@@ -4002,30 +4023,61 @@ mod tests {
         if !blob.is_empty() {
             blob.push(0); // 属性列表结束符计入 PropertyListLen
         }
-        let head = 4 + 4 + 4 + 1 + s.name.len();
+        let fields = if wide { 8 * 3 + 1 } else { 4 * 3 + 1 };
+        let head = fields + s.name.len();
+        let tail = if wide { 25 } else { 13 }; // 子节点结束空记录
         let mut kids = Vec::new();
         for c in &s.children {
             let at = base + head + blob.len() + kids.len();
-            kids.extend_from_slice(&node(c, at));
+            kids.extend_from_slice(&node_v(c, at, ver));
         }
-        let node_end = base + head + blob.len() + kids.len() + 13;
+        let node_end = base + head + blob.len() + kids.len() + tail;
         let mut out = Vec::new();
-        out.extend_from_slice(&(node_end as u32).to_le_bytes());
-        out.extend_from_slice(&(s.props.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+        if wide {
+            out.extend_from_slice(&(node_end as u64).to_le_bytes());
+            out.extend_from_slice(&(s.props.len() as u64).to_le_bytes());
+            out.extend_from_slice(&(blob.len() as u64).to_le_bytes());
+        } else {
+            out.extend_from_slice(&(node_end as u32).to_le_bytes());
+            out.extend_from_slice(&(s.props.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+        }
         out.push(s.name.len() as u8);
         out.extend_from_slice(s.name.as_bytes());
         out.extend_from_slice(&blob);
         out.extend_from_slice(&kids);
-        out.extend_from_slice(&[0u8; 13]); // 子节点结束空记录
+        out.extend_from_slice(&vec![0u8; tail]);
         out
     }
 
     /// 版本 7400 文档外壳：魔数 + 版本 + 保留 + 文档结束偏移 + 无名根节点
     fn fbx_doc(top: Vec<Spec>) -> Vec<u8> {
+        fbx_doc_v(7400, top)
+    }
+
+    fn fbx_doc_v(ver: u32, top: Vec<Spec>) -> Vec<u8> {
+        let wide = ver >= 7500;
         let mut buf = Vec::new();
         buf.extend_from_slice(b"Kaydara FBX Binary  \x00\x1A\x00");
-        buf.extend_from_slice(&7400u32.to_le_bytes());
+        buf.extend_from_slice(&ver.to_le_bytes());
+        if wide {
+            // FBX SDK ≥7500：版本号后直接跟第一条节点记录，没有保留/文档偏移字段
+            let root_base = buf.len();
+            let root_head = 8 * 3 + 1;
+            let root_tail = 25;
+            let mut kids = Vec::new();
+            for s in &top {
+                let at = root_base + root_head + kids.len();
+                kids.extend_from_slice(&node_v(s, at, ver));
+            }
+            buf.extend_from_slice(&((root_base + root_head + kids.len() + root_tail) as u64).to_le_bytes());
+            buf.extend_from_slice(&0u64.to_le_bytes()); // num_properties
+            buf.extend_from_slice(&0u64.to_le_bytes()); // property_list_len
+            buf.push(0); // name_length
+            buf.extend_from_slice(&kids);
+            buf.extend_from_slice(&[0u8; 25]);
+            return buf;
+        }
         buf.extend_from_slice(&0u32.to_le_bytes()); // 保留
         let doc_end_at = buf.len();
         buf.extend_from_slice(&0u32.to_le_bytes()); // 文档结束偏移，最后回填
@@ -4083,18 +4135,26 @@ mod tests {
 
     /// Blender：网格数据放在名为 Vertices / PolygonVertexIndex 的子节点里，且 zlib 压缩
     fn build_fbx_blender(verts: &[f64], poly_idx: &[i32]) -> Vec<u8> {
-        fbx_doc(vec![fbx_objects(vec![
-            Spec {
-                name: "Vertices",
-                props: vec![p_d_zipped(verts)],
-                children: vec![],
-            },
-            Spec {
-                name: "PolygonVertexIndex",
-                props: vec![p_i_zipped(poly_idx)],
-                children: vec![],
-            },
-        ])])
+        build_fbx_blender_v(verts, poly_idx, 7400)
+    }
+
+    /// 同上，可指定 FBX 版本（≥7500 时节点头为 64 位）
+    fn build_fbx_blender_v(verts: &[f64], poly_idx: &[i32], ver: u32) -> Vec<u8> {
+        fbx_doc_v(
+            ver,
+            vec![fbx_objects(vec![
+                Spec {
+                    name: "Vertices",
+                    props: vec![p_d_zipped(verts)],
+                    children: vec![],
+                },
+                Spec {
+                    name: "PolygonVertexIndex",
+                    props: vec![p_i_zipped(poly_idx)],
+                    children: vec![],
+                },
+            ])],
+        )
     }
 
     /// 8 顶点立方体：6 个四边形面，负数收尾
@@ -4145,6 +4205,19 @@ mod tests {
         let (verts, poly) = cube_data();
         let mesh = load_fbx_binary(&build_fbx_blender(&verts, &poly)).expect("blender fbx");
         assert_cube(&mesh);
+    }
+
+    /// FBX 7500+ 的节点头是 64 位偏移/计数/属性长度。此前按 32 位读，
+    /// 会把 NumProperties 的高 4 字节（恒 0）当成 PropertyListLen，
+    /// 导致属性全部跳过、所有 ≥7.5 文件都报「未找到多边形网格」。
+    #[test]
+    fn load_fbx_binary_7500_u64_node_header() {
+        let (verts, poly) = cube_data();
+        for ver in [7500u32, 7700] {
+            let mesh = load_fbx_binary(&build_fbx_blender_v(&verts, &poly, ver))
+                .unwrap_or_else(|e| panic!("fbx {ver} 解析失败: {e}"));
+            assert_cube(&mesh);
+        }
     }
     /// 用真实导出文件验证解析器（文件不入库）：
     /// `DADAVIEW_FBX=模型.fbx cargo test -- --ignored load_real_fbx_sample`
